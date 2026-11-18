@@ -42,8 +42,16 @@ const STATUS_EVERY: Duration = Duration::from_secs(60);
 
 fn main() {
     let _ = vita_fs::create_dir_all(std::path::Path::new(config::CONFIG_DIR));
+    // Read the config before starting the logger so `log_level` applies to
+    // every line; errors are logged once the logger is up.
+    let loaded = ListenerConfig::load_or_init();
+    let filter = match &loaded {
+        Ok((c, _)) => c.log_level.clone(),
+        Err(_) => "info".into(),
+    };
     match vita_log::init_with_config(LogConfig {
         path: LOG_PATH.into(),
+        filter,
         rotate_bytes: 1024 * 1024,
         keep_files: 2,
         ..LogConfig::default()
@@ -55,13 +63,13 @@ fn main() {
         }
     }
     info!(build = env!("BUILD_TIMESTAMP"), version = env!("CARGO_PKG_VERSION"), "listener.startup");
-    run();
+    run(loaded);
     vita_log::flush();
     thread::sleep(Duration::from_secs(1));
 }
 
-fn run() {
-    let (lcfg, created) = match ListenerConfig::load_or_init() {
+fn run(loaded: Result<(ListenerConfig, bool), config::LoadError>) {
+    let (lcfg, created) = match loaded {
         Ok(v) => v,
         Err(e) => {
             error!(error = %e, "listener.config.invalid");
