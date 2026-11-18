@@ -391,18 +391,20 @@ fn filter_rule_from_wire(wire: &FilterRuleWire) -> Option<FilterRule> {
     let src_ips = wire
         .src_ips
         .iter()
-        .filter_map(|src| parse_filter_cidr(src))
+        .flat_map(|src| parse_filter_addrs(src))
         .collect::<Vec<_>>();
     let dst_ports = wire
         .dst_ports
         .iter()
-        .filter_map(|dst| {
-            let ip = parse_filter_cidr(&dst.ip)?;
-            (dst.ports.first <= dst.ports.last).then_some(NetPortRange {
-                ip,
-                port_first: dst.ports.first,
-                port_last: dst.ports.last,
-            })
+        .filter(|dst| dst.ports.first <= dst.ports.last)
+        .flat_map(|dst| {
+            parse_filter_addrs(&dst.ip)
+                .into_iter()
+                .map(move |ip| NetPortRange {
+                    ip,
+                    port_first: dst.ports.first,
+                    port_last: dst.ports.last,
+                })
         })
         .collect::<Vec<_>>();
     // A malformed or IPv6-only rule must not accidentally become an allow.
@@ -413,17 +415,53 @@ fn filter_rule_from_wire(wire: &FilterRuleWire) -> Option<FilterRule> {
     })
 }
 
-fn parse_filter_cidr(s: &str) -> Option<AllowedIp> {
+/// Parse one tailcfg filter address: `*`, an IPv4 address, an IPv4 CIDR, or
+/// an inclusive IPv4 range `a.b.c.d-e.f.g.h`. Ranges are what Tailscale's
+/// control plane sends for the default ACL (all of 100.64.0.0/10 minus a
+/// reserved block), so they must expand to CIDRs rather than be dropped.
+/// IPv6 and malformed entries yield nothing.
+///
+/// tailvita-mcp patch: upstream (rev 88a992c) handled only `*`, single
+/// addresses and CIDRs, so a range-only rule was discarded and the inbound
+/// policy became an empty, deny-all rule list.
+fn parse_filter_addrs(s: &str) -> Vec<AllowedIp> {
     if s == "*" {
-        return Some(AllowedIp {
+        return vec![AllowedIp {
             addr: Ipv4Addr::UNSPECIFIED,
             prefix: 0,
-        });
+        }];
     }
     if let Ok(addr) = s.parse::<Ipv4Addr>() {
-        return Some(AllowedIp { addr, prefix: 32 });
+        return vec![AllowedIp { addr, prefix: 32 }];
     }
-    parse_ipv4_cidr(s)
+    if let Some((a, b)) = s.split_once('-') {
+        return match (a.trim().parse::<Ipv4Addr>(), b.trim().parse::<Ipv4Addr>()) {
+            (Ok(a), Ok(b)) if u32::from(a) <= u32::from(b) => range_to_cidrs(a.into(), b.into()),
+            _ => Vec::new(),
+        };
+    }
+    parse_ipv4_cidr(s).into_iter().collect()
+}
+
+/// Smallest set of CIDRs that exactly covers the inclusive range `lo..=hi`.
+fn range_to_cidrs(mut lo: u32, hi: u32) -> Vec<AllowedIp> {
+    let mut out = Vec::new();
+    loop {
+        // Largest block aligned at `lo` that stays within `hi`.
+        let mut size_log2 = lo.trailing_zeros().min(32);
+        while size_log2 > 0 && (lo as u64 + (1u64 << size_log2) - 1) > hi as u64 {
+            size_log2 -= 1;
+        }
+        out.push(AllowedIp {
+            addr: Ipv4Addr::from(lo),
+            prefix: (32 - size_log2) as u8,
+        });
+        let next = lo as u64 + (1u64 << size_log2);
+        if next > hi as u64 {
+            return out;
+        }
+        lo = next as u32;
+    }
 }
 
 fn apply_patch_fields(peer: &mut PeerSnapshot, patch: &PeerChangeWire) {
@@ -1034,6 +1072,56 @@ mod tests {
         let delta = nm.apply(&MapResponseWire::default());
         assert!(!delta.packet_filter_changed);
         assert!(matches!(nm.packet_filter, Some(PacketFilter::Rules(_))));
+    }
+
+    #[test]
+    fn filter_ranges_expand_to_cidrs() {
+        let c = |s: &str, p: u8| AllowedIp { addr: s.parse().unwrap(), prefix: p };
+        assert_eq!(parse_filter_addrs("100.64.0.0-100.127.255.255"), vec![c("100.64.0.0", 10)]);
+        assert_eq!(parse_filter_addrs("10.0.0.1-10.0.0.1"), vec![c("10.0.0.1", 32)]);
+        assert_eq!(
+            parse_filter_addrs("10.0.0.1-10.0.0.6"),
+            vec![c("10.0.0.1", 32), c("10.0.0.2", 31), c("10.0.0.4", 31), c("10.0.0.6", 32)]
+        );
+        assert_eq!(parse_filter_addrs("0.0.0.0-255.255.255.255"), vec![c("0.0.0.0", 0)]);
+        assert_eq!(parse_filter_addrs("255.255.255.255-255.255.255.255"), vec![c("255.255.255.255", 32)]);
+        assert!(parse_filter_addrs("10.0.0.9-10.0.0.1").is_empty());
+        assert!(parse_filter_addrs("fd7a:115c:a1e0::/48").is_empty());
+        assert!(parse_filter_addrs("10.0.0.1-junk").is_empty());
+    }
+
+    /// The default-ACL rule as controlplane.tailscale.com sends it
+    /// (captured 2026-11-18): range sources plus an IPv6 prefix.
+    #[test]
+    fn default_acl_range_rule_allows_tailnet_and_skips_reserved_block() {
+        let mut nm = NetMap::default();
+        let resp: MapResponseWire = serde_json::from_slice(
+            br#"{
+            "PacketFilter":[{
+                "SrcIPs":["100.115.94.0-100.127.255.255","100.64.0.0-100.115.91.255","fd7a:115c:a1e0::/48"],
+                "DstPorts":[{"IP":"*","Ports":{"First":0,"Last":65535}}]
+            }]
+        }"#,
+        )
+        .unwrap();
+        nm.apply(&resp);
+        let Some(PacketFilter::Rules(rules)) = &nm.packet_filter else {
+            panic!("expected rules");
+        };
+        assert_eq!(rules.len(), 1);
+        let covers = |ip: &str| {
+            let ip: Ipv4Addr = ip.parse().unwrap();
+            rules[0].src_ips.iter().any(|c| {
+                let mask = if c.prefix == 0 { 0 } else { u32::MAX << (32 - c.prefix) };
+                (u32::from(ip) & mask) == (u32::from(c.addr) & mask)
+            })
+        };
+        for ok in ["100.97.211.40", "100.115.254.73", "100.64.0.0", "100.127.255.255", "100.115.91.255", "100.115.94.0"] {
+            assert!(covers(ok), "{ok} should be allowed");
+        }
+        for no in ["100.115.92.1", "100.115.93.255", "100.63.255.255", "100.128.0.0", "10.0.0.200"] {
+            assert!(!covers(no), "{no} should not be allowed");
+        }
     }
 
     #[test]

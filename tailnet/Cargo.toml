@@ -32,3 +32,7 @@ opt-level = 2
 # repeat upstream's ring patch here. Without it ring has no Vita target support.
 [patch.crates-io]
 ring = { git = "https://github.com/vita-rust/ring", branch = "v0.17.14-vita" }
+
+# ts-control with the packet-filter IP-range fix (vendor/ts-control/PATCHES.md).
+[patch."https://github.com/koalabuttz/tailscale-vita"]
+ts-control = { path = "vendor/ts-control" }
