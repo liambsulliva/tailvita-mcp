@@ -4,6 +4,7 @@
 #include "parser.h"
 #include "promote.h"
 #include "reboot.h"
+#include "screenshot.h"
 #include "version.h"
 #include <stdarg.h>
 #include <stdbool.h>
@@ -35,6 +36,7 @@ const cmd_definition cmd_definitions[] = {
     {.name = "reboot", .description = "Reboot the console", .min_arg_count = 0, .max_arg_count = 0, .validator = NULL, .executor = &cmd_reboot},
     {.name = "release", .description = "Release a synthetic input", .min_arg_count = 1, .max_arg_count = 2, .validator = &validate_release, .executor = &cmd_release},
     {.name = "screen", .description = "Turn the screen on or off", .min_arg_count = 1, .max_arg_count = 1, .validator = NULL, .executor = &cmd_screen},
+    {.name = "screenshot", .description = "Save the displayed frame as a BMP under ux0:data/", .min_arg_count = 0, .max_arg_count = 1, .validator = NULL, .executor = &cmd_screenshot},
     {.name = "version", .description = "Display the Vita Companion version", .min_arg_count = 0, .max_arg_count = 0, .validator = NULL, .executor = &cmd_version},
     {.name = "wait", .description = "Wait for a duration such as 100ms or 3s", .min_arg_count = 1, .max_arg_count = 1, .validator = &validate_wait, .executor = &cmd_wait}
 };

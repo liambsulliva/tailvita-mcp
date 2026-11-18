@@ -17,3 +17,5 @@ vitacompanion_kernel:
         - vitaCompanionKernelReset
         - vitaCompanionKernelRequestReboot
         - vitaCompanionKernelForceReboot
+        - vitaCompanionKernelScreenInfo
+        - vitaCompanionKernelScreenReadRow

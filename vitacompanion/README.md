@@ -98,6 +98,7 @@ echo 'press cross; wait 100ms; release cross' | nc IP_TO_PSVITA 1338
 | `reboot`  | none                            | reboot the console           |
 | `release` | input target                    | release one input or all synthetic input |
 | `screen`  | `on` or `off`                   | turn screen on or off        |
+| `screenshot` | optional `ux0:data/<name>.bmp` | save the displayed frame (any app) as a 24-bit BMP, default `ux0:data/vitacompanion/screenshot.bmp`. Needs the matching kernel module (ABI 4) |
 | `version` | none                            | display the loaded Vita Companion module version |
 | `wait`    | duration ending in `ms` or `s`  | wait before executing the next chained command |
 
