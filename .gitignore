@@ -1,0 +1,23 @@
+# Secrets and device state
+*.priv
+auth-key*
+token.txt
+*.token
+.env
+.env.*
+secrets/
+.vita-agent-token
+
+# Build outputs
+build/
+target/
+*.vpk
+*.suprx
+*.skprx
+*.velf
+*.elf
+
+# Tooling
+__pycache__/
+.venv*/
+.DS_Store
