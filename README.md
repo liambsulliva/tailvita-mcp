@@ -7,9 +7,9 @@ Tools for driving a PS Vita with AI agents, reachable over a Tailscale tailnet.
 | Path | What it is | Status |
 | --- | --- | --- |
 | `vitacompanion/` | Companion firmware: FTP server, command port, kernel and user plugins. Forked from [devnoname120/vitacompanion](https://github.com/devnoname120/vitacompanion). History is kept under this path. | Imported |
-| `tailnet/` | Tailnet listener that exposes the Vita's services on the tailnet. | Built (Phase 1) |
+| `tailnet/` | Tailnet listener that exposes the Vita's services on the tailnet. | Working: Mac and NAS reach 1337 and 1338 |
 | `ps-vita-mcp/` | devloop and resident MCP servers. | Pending import from Mac |
-| `vitacompanion-slim/` | Memory-reduced companion mods and the vitacompanion MCP server. | Pending import from Mac |
+| `vitacompanion-slim/` | Memory-reduced companion mods and the vitacompanion MCP server. | Imported; its memory knobs are ported to `vitacompanion/` |
 
 ## Conventions
 
