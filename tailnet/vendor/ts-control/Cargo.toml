@@ -1,0 +1,44 @@
+# Vendored from koalabuttz/tailscale-vita rev 88a992c, crates/ts-control (MIT).
+# Patched in tailvita-mcp: see PATCHES.md. Workspace-inherited fields and
+# dependencies are written out with upstream's workspace values; sibling
+# crates come from the same pinned git revision.
+
+[package]
+name = "ts-control"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[dependencies]
+ureq        = { version = "3", default-features = false, features = ["rustls", "json"] }
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+base64      = { version = "0.22", default-features = false, features = ["alloc"] }
+thiserror   = "1"
+snow        = { version = "0.10", default-features = false, features = [
+    "default-resolver", "use-curve25519", "use-chacha20poly1305", "use-blake2",
+    "use-getrandom", "std",
+] }
+chacha20poly1305 = "0.10"
+httparse    = { version = "1", default-features = false, features = ["std"] }
+h2          = "0.4"
+tokio       = { version = "1", default-features = false, features = ["rt", "macros", "sync", "time"] }
+bytes       = "1"
+http        = "1"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+rand_core    = { version = "0.6", features = ["getrandom"] }
+time         = { version = "0.3", default-features = false, features = ["macros", "parsing", "formatting", "serde", "alloc"] }
+flate2       = { version = "1", default-features = false, features = ["zlib-rs"] }
+ruzstd       = { version = "0.7", default-features = false, features = ["std"] }
+rustls           = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = "1"
+webpki-roots     = "1"
+
+vita-log    = { git = "https://github.com/koalabuttz/tailscale-vita", rev = "88a992c" }
+vita-sync   = { git = "https://github.com/koalabuttz/tailscale-vita", rev = "88a992c" }
+vita-thread = { git = "https://github.com/koalabuttz/tailscale-vita", rev = "88a992c" }
+vita-fs     = { git = "https://github.com/koalabuttz/tailscale-vita", rev = "88a992c" }

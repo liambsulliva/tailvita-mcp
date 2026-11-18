@@ -1,0 +1,1053 @@
+//! In-memory netmap state, updated by `MapResponse` frames.
+//!
+//! `apply` merges a non-keepalive `MapResponseWire` into the local
+//! `NetMap` and returns a `NetMapDelta` describing the changes for
+//! the demo to push into `wg-engine`. The demo never sees the wire
+//! types directly — only the typed snapshots.
+//!
+//! Delta semantics:
+//!
+//! - `Peers` (full set) → clear, replace.
+//! - `PeersChanged` → upsert.
+//! - `PeersRemoved` (NodeID list) → look up via `id_to_key`, drop.
+//! - `PeersChangedPatch` (sparse) → apply per-field updates onto
+//!   existing peers; emit a `RekeyedPeer` if `Key` changed (caller
+//!   must drop the old `Tunn` and create a new one).
+//! - `Node` → record our own tailnet addresses.
+//! - `DERPMap` → replace wholesale.
+
+use std::collections::HashMap;
+use std::net::{Ipv4Addr, SocketAddr};
+
+use vita_log::{debug, info, warn};
+
+use crate::types::{
+    DerpMapWire, FilterRuleWire, MapResponseWire, NodeWire, PacketFilterWire, PeerChangeWire,
+    UserProfileWire,
+};
+
+/// 32 raw bytes — the binary form of a `nodekey:<hex>` value.
+pub type NodeKeyBytes = [u8; 32];
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AllowedIp {
+    pub addr: Ipv4Addr,
+    pub prefix: u8,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NetPortRange {
+    pub ip: AllowedIp,
+    pub port_first: u16,
+    pub port_last: u16,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FilterRule {
+    pub src_ips: Vec<AllowedIp>,
+    pub dst_ports: Vec<NetPortRange>,
+    /// Empty means every IP protocol.
+    pub ip_protocols: Vec<u8>,
+}
+
+/// `None` in [`NetMap`] means the first policy-bearing MapResponse has not
+/// arrived. Consumers must treat that state as deny-all.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PacketFilter {
+    Rules(Vec<FilterRule>),
+}
+
+#[derive(Clone, Debug)]
+pub struct PeerSnapshot {
+    pub node_id: i64,
+    pub node_key: NodeKeyBytes,
+    pub disco_key: Option<NodeKeyBytes>,
+    pub name: String,
+    pub allowed_ips: Vec<AllowedIp>,
+    pub home_derp: u16,
+    pub online: bool,
+    /// M12: peer's advertised direct-path UDP candidates. Empty for
+    /// peers running pre-M12 clients. Strings that don't parse as
+    /// SocketAddr are silently dropped (logged at trace level).
+    pub endpoints: Vec<SocketAddr>,
+    /// M17-B: RFC3339 last-seen; typically only set for offline peers.
+    pub last_seen: Option<String>,
+    /// M17-B: RFC3339 key-expiry (`0001-…` = expiry disabled).
+    pub key_expiry: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DerpRegionSnapshot {
+    pub region_id: u16,
+    pub region_code: String,
+    pub region_name: String,
+    pub nodes: Vec<DerpNodeSnapshot>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DerpNodeSnapshot {
+    pub name: String,
+    pub region_id: u16,
+    pub hostname: String,
+    pub ipv4: String,
+    pub ipv6: String,
+    pub derp_port: u16,
+    pub stun_port: i32,
+}
+
+/// M19: display identity for a user owning one or more nodes, keyed by
+/// server user ID in `NetMap.user_profiles`. Domain form of
+/// `UserProfileWire`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UserProfile {
+    pub id: i64,
+    pub login_name: String,
+    pub display_name: String,
+}
+
+#[derive(Default)]
+pub struct NetMap {
+    pub our_addrs: Vec<AllowedIp>,
+    pub packet_filter: Option<PacketFilter>,
+    /// M15-B: tags the server has assigned to our node, computed from
+    /// the auth-key + tailnet ACL policy. Empty when the auth-key
+    /// wasn't tagged — runtime emits a warning on first MapResponse
+    /// in that case ("full tailnet access; recommend re-issuing with
+    /// `--tags=tag:vita` and writing an ACL"). Surfaced in
+    /// `RuntimeSnapshot.acl.tags` for LocalAPI consumers.
+    pub our_tags: Vec<String>,
+    /// M17-B: our own node's RFC3339 key-expiry, captured from the self
+    /// Node on each full MapResponse. `None` if the server omitted it;
+    /// `0001-…` zero value means expiry is disabled. Surfaced as
+    /// `RuntimeSnapshot.our_key_expiry` — the silent-drop-off warning.
+    pub our_key_expiry: Option<String>,
+    pub peers: HashMap<NodeKeyBytes, PeerSnapshot>,
+    /// Secondary index: server-assigned NodeID → NodeKey. Lets us
+    /// resolve `PeersRemoved` and `PeersChangedPatch` entries (which
+    /// reference NodeID) back to a peer.
+    pub id_to_key: HashMap<i64, NodeKeyBytes>,
+    pub derp_regions: HashMap<u16, DerpRegionSnapshot>,
+    pub last_seq: i64,
+    pub session_handle: String,
+    pub domain: String,
+    /// M19 identity card: user ID → profile, accumulated by **delta
+    /// upsert** across frames (control sends only new/changed profiles
+    /// since CapVer 5). Never wholesale-replaced — a profile-less frame
+    /// must leave prior identities intact.
+    pub user_profiles: HashMap<i64, UserProfile>,
+    /// M19: our own node's owning user ID, captured from the self Node.
+    /// `None` until a self Node carrying a non-zero `User` arrives.
+    /// Guarded like `our_key_expiry`: a peers-only or `User`-omitting
+    /// frame can't blank it. Resolved lazily against `user_profiles`
+    /// (they can land in different frames) via `our_login_name`.
+    pub our_user_id: Option<i64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RekeyedPeer {
+    pub old_key: NodeKeyBytes,
+    pub snapshot: PeerSnapshot,
+}
+
+#[derive(Default, Debug)]
+pub struct NetMapDelta {
+    pub upserted: Vec<PeerSnapshot>,
+    pub removed: Vec<NodeKeyBytes>,
+    pub rekeyed: Vec<RekeyedPeer>,
+    pub our_addrs_changed: bool,
+    pub packet_filter_changed: bool,
+    pub derp_map_changed: bool,
+    pub patches_applied: usize,
+    pub patches_skipped_unknown_node_id: usize,
+    pub seq: i64,
+}
+
+impl NetMap {
+    /// Apply a non-keepalive `MapResponse`. Caller MUST short-circuit
+    /// on `keep_alive=true` before invoking this.
+    pub(crate) fn apply(&mut self, resp: &MapResponseWire) -> NetMapDelta {
+        let mut delta = NetMapDelta::default();
+
+        if resp.seq > self.last_seq {
+            self.last_seq = resp.seq;
+        }
+        delta.seq = self.last_seq;
+        if !resp.map_session_handle.is_empty() {
+            self.session_handle = resp.map_session_handle.clone();
+        }
+        if !resp.domain.is_empty() {
+            self.domain = resp.domain.clone();
+        }
+
+        if let Some(node) = &resp.node {
+            // Diagnostic for the M14 DiscoKey-zero issue: dump what
+            // Tailscale's server says our own Node record looks like.
+            // If our disco_key is zeros here, it confirms server-side
+            // rejection of our MapRequest's DiscoKey field.
+            info!(
+                key = %node.key,
+                disco_key = %node.disco_key,
+                online = ?node.online,
+                addr_count = node.addresses.len(),
+                "control.map.our_node.recv"
+            );
+            let new_addrs = parse_addrs(&node.addresses);
+            if !new_addrs.is_empty() && new_addrs != self.our_addrs {
+                info!(addrs = ?new_addrs, "control.map.our_addrs.set");
+                self.our_addrs = new_addrs;
+                delta.our_addrs_changed = true;
+            }
+            // M15-B: capture our assigned tags. Server recomputes on
+            // every full Node frame (which is what we get on first
+            // map and on PeersChanged frames carrying ours). Quietly
+            // replace; the runtime's first-MapResponse hook handles
+            // the user-visible warn-if-untagged case.
+            if node.tags != self.our_tags {
+                info!(tags = ?node.tags, "control.map.our_tags.set");
+                self.our_tags = node.tags.clone();
+            }
+            // M17-B: capture our own key-expiry so the UI can warn before
+            // the node silently drops off the tailnet. Only overwrite on a
+            // present value — a PeersChanged frame carrying peers but not a
+            // fresh self Node shouldn't clear it.
+            if node.key_expiry.is_some() && node.key_expiry != self.our_key_expiry {
+                info!(key_expiry = ?node.key_expiry, "control.map.our_key_expiry.set");
+                self.our_key_expiry = node.key_expiry.clone();
+            }
+            // M19: capture our owning user ID for the identity card, guarded
+            // exactly like key-expiry above — `User == 0` means the field
+            // was omitted, so a self Node without it (or a later frame)
+            // can't blank a previously-learned id. Resolved to a login name
+            // lazily by `our_login_name` (the UserProfile may arrive in a
+            // different frame).
+            if node.user != 0 && Some(node.user) != self.our_user_id {
+                info!(user = node.user, "control.map.our_user_id.set");
+                self.our_user_id = Some(node.user);
+            }
+        }
+
+        // M19: delta-upsert the identity profiles. Control sends only
+        // new/changed `UserProfiles` per frame (CapVer 5), so we merge
+        // rather than replace — a no-change frame's empty list iterates
+        // zero times and leaves the accumulated map intact. Copies the
+        // `PeersChanged` upsert idiom below, NOT the full-set `Peers`
+        // replace (which would blank identity on every quiescent frame).
+        for up in &resp.user_profiles {
+            self.user_profiles.insert(up.id, user_profile_from_wire(up));
+        }
+
+        if let Some(dmap) = &resp.derp_map {
+            self.derp_regions = parse_derp_regions(dmap);
+            info!(
+                region_count = self.derp_regions.len(),
+                "control.map.derp_map.set"
+            );
+            delta.derp_map_changed = true;
+        }
+
+        match &resp.packet_filter {
+            PacketFilterWire::Missing => {}
+            PacketFilterWire::Rules(rules) => {
+                let next =
+                    PacketFilter::Rules(rules.iter().filter_map(filter_rule_from_wire).collect());
+                if self.packet_filter.as_ref() != Some(&next) {
+                    let rule_count = match &next {
+                        PacketFilter::Rules(rules) => rules.len(),
+                    };
+                    info!(rule_count, "control.map.packet_filter.set");
+                    self.packet_filter = Some(next);
+                    delta.packet_filter_changed = true;
+                }
+            }
+        }
+
+        if let Some(peers) = &resp.peers {
+            // Full set replace: every peer not in the new list is
+            // implicitly removed.
+            let new_keys: HashMap<NodeKeyBytes, ()> = peers
+                .iter()
+                .filter_map(|n| parse_nodekey(&n.key).map(|k| (k, ())))
+                .collect();
+            let old_keys: Vec<NodeKeyBytes> = self.peers.keys().copied().collect();
+            for old in old_keys {
+                if !new_keys.contains_key(&old) {
+                    self.peers.remove(&old);
+                    delta.removed.push(old);
+                }
+            }
+            // Rebuild id_to_key from scratch since IDs may have shifted.
+            self.id_to_key.clear();
+            for n in peers {
+                if let Some(snap) = node_to_snapshot(n) {
+                    self.id_to_key.insert(snap.node_id, snap.node_key);
+                    self.peers.insert(snap.node_key, snap.clone());
+                    delta.upserted.push(snap);
+                }
+            }
+        }
+
+        if let Some(peers_changed) = &resp.peers_changed {
+            for n in peers_changed {
+                if let Some(snap) = node_to_snapshot(n) {
+                    self.id_to_key.insert(snap.node_id, snap.node_key);
+                    self.peers.insert(snap.node_key, snap.clone());
+                    delta.upserted.push(snap);
+                }
+            }
+        }
+
+        if let Some(removed_ids) = &resp.peers_removed {
+            for id in removed_ids {
+                if let Some(key) = self.id_to_key.remove(id) {
+                    self.peers.remove(&key);
+                    delta.removed.push(key);
+                }
+            }
+        }
+
+        if let Some(patches) = &resp.peers_changed_patch {
+            for patch in patches {
+                self.apply_patch(patch, &mut delta);
+            }
+        }
+
+        debug!(
+            seq = delta.seq,
+            upserted = delta.upserted.len(),
+            removed = delta.removed.len(),
+            rekeyed = delta.rekeyed.len(),
+            patches = delta.patches_applied,
+            "control.map.delta"
+        );
+        delta
+    }
+
+    fn apply_patch(&mut self, patch: &PeerChangeWire, delta: &mut NetMapDelta) {
+        let Some(&node_key) = self.id_to_key.get(&patch.node_id) else {
+            warn!(node_id = patch.node_id, "control.map.patch.unknown_node_id");
+            delta.patches_skipped_unknown_node_id += 1;
+            return;
+        };
+        let Some(peer) = self.peers.get_mut(&node_key) else {
+            warn!(node_id = patch.node_id, "control.map.patch.missing_peer");
+            delta.patches_skipped_unknown_node_id += 1;
+            return;
+        };
+
+        // Rekey: NodeKey rotation. Old `Tunn` is invalid; emit a
+        // RekeyedPeer event so the demo can drop+create.
+        if let Some(new_key_str) = &patch.key {
+            if let Some(new_key) = parse_nodekey(new_key_str) {
+                if new_key != node_key {
+                    let mut new_peer = peer.clone();
+                    new_peer.node_key = new_key;
+                    apply_patch_fields(&mut new_peer, patch);
+                    let old_key = node_key;
+                    self.peers.remove(&old_key);
+                    self.id_to_key.insert(new_peer.node_id, new_key);
+                    self.peers.insert(new_key, new_peer.clone());
+                    delta.rekeyed.push(RekeyedPeer {
+                        old_key,
+                        snapshot: new_peer,
+                    });
+                    delta.patches_applied += 1;
+                    return;
+                }
+            }
+        }
+
+        apply_patch_fields(peer, patch);
+        delta.patches_applied += 1;
+        delta.upserted.push(peer.clone());
+    }
+
+    /// M19 identity card: our own login name, resolving `our_user_id`
+    /// against the accumulated `user_profiles` lazily (id and profile can
+    /// arrive in different frames). Returns `None` until both have landed.
+    /// Tagged nodes point `Node.User` at a tag pseudo-user with no human
+    /// login name (absent profile, or a profile with an empty
+    /// `LoginName`), which also yields `None` — the UI falls back to the
+    /// hostname.
+    pub fn our_login_name(&self) -> Option<&str> {
+        let id = self.our_user_id?;
+        let profile = self.user_profiles.get(&id)?;
+        if profile.login_name.is_empty() {
+            None
+        } else {
+            Some(profile.login_name.as_str())
+        }
+    }
+}
+
+fn user_profile_from_wire(w: &UserProfileWire) -> UserProfile {
+    UserProfile {
+        id: w.id,
+        login_name: w.login_name.clone(),
+        display_name: w.display_name.clone(),
+    }
+}
+
+fn filter_rule_from_wire(wire: &FilterRuleWire) -> Option<FilterRule> {
+    let src_ips = wire
+        .src_ips
+        .iter()
+        .filter_map(|src| parse_filter_cidr(src))
+        .collect::<Vec<_>>();
+    let dst_ports = wire
+        .dst_ports
+        .iter()
+        .filter_map(|dst| {
+            let ip = parse_filter_cidr(&dst.ip)?;
+            (dst.ports.first <= dst.ports.last).then_some(NetPortRange {
+                ip,
+                port_first: dst.ports.first,
+                port_last: dst.ports.last,
+            })
+        })
+        .collect::<Vec<_>>();
+    // A malformed or IPv6-only rule must not accidentally become an allow.
+    (!src_ips.is_empty() && !dst_ports.is_empty()).then_some(FilterRule {
+        src_ips,
+        dst_ports,
+        ip_protocols: wire.ip_proto.clone(),
+    })
+}
+
+fn parse_filter_cidr(s: &str) -> Option<AllowedIp> {
+    if s == "*" {
+        return Some(AllowedIp {
+            addr: Ipv4Addr::UNSPECIFIED,
+            prefix: 0,
+        });
+    }
+    if let Ok(addr) = s.parse::<Ipv4Addr>() {
+        return Some(AllowedIp { addr, prefix: 32 });
+    }
+    parse_ipv4_cidr(s)
+}
+
+fn apply_patch_fields(peer: &mut PeerSnapshot, patch: &PeerChangeWire) {
+    if let Some(home) = patch.home_derp {
+        peer.home_derp = home;
+    } else if let Some(legacy) = patch.derp_region_legacy {
+        peer.home_derp = legacy;
+    }
+    if let Some(disco) = &patch.disco_key {
+        if let Some(d) = parse_nodekey_with_prefix(disco, "discokey:") {
+            peer.disco_key = Some(d);
+        }
+    }
+    if let Some(online) = patch.online {
+        peer.online = online;
+    }
+    if let Some(endpoints) = &patch.endpoints {
+        peer.endpoints = parse_endpoints(endpoints);
+    }
+    // M17-B: sparse patches carry these when a peer goes idle / rekeys.
+    if patch.last_seen.is_some() {
+        peer.last_seen = patch.last_seen.clone();
+    }
+    if patch.key_expiry.is_some() {
+        peer.key_expiry = patch.key_expiry.clone();
+    }
+}
+
+fn node_to_snapshot(n: &NodeWire) -> Option<PeerSnapshot> {
+    let node_key = parse_nodekey(&n.key)?;
+    let disco_key = if n.disco_key.is_empty() {
+        None
+    } else {
+        parse_nodekey_with_prefix(&n.disco_key, "discokey:")
+    };
+    // CapVer >= 112 contract ("2025-01-14: Client interprets AllowedIPs
+    // of nil as meaning same as Addresses" — tailcfg V112; we advertise
+    // 138): control OMITS Node.AllowedIPs for peers whose route set
+    // equals their Addresses, i.e. nearly every normal node. An absent/
+    // empty list therefore means "derive from Addresses", NOT "no
+    // routes". Without this, every ordinary peer entered wg-engine with
+    // zero AllowedIPs, the outbound IP lookup missed all /32s, and any
+    // exit node's explicitly-sent 0.0.0.0/0 swallowed EVERY data frame
+    // (root cause of the wg data-plane bug, found 2026-07-02: all echo
+    // replies were encrypted for + sent to the exit node `tailscale-1`).
+    let mut allowed_ips = parse_addrs(&n.allowed_ips);
+    if allowed_ips.is_empty() {
+        allowed_ips = parse_addrs(&n.addresses);
+    }
+    let home_derp = if n.home_derp != 0 {
+        n.home_derp
+    } else {
+        parse_legacy_derp(&n.derp_legacy).unwrap_or(0)
+    };
+    Some(PeerSnapshot {
+        node_id: n.id,
+        node_key,
+        disco_key,
+        name: n.name.clone(),
+        allowed_ips,
+        home_derp,
+        online: n.online.unwrap_or(false),
+        endpoints: parse_endpoints(&n.endpoints),
+        last_seen: n.last_seen.clone(),
+        key_expiry: n.key_expiry.clone(),
+    })
+}
+
+/// Parse the wire `["1.2.3.4:41641", "[v6]:port", ...]` strings into
+/// `SocketAddr`. Bad entries are dropped silently — a peer advertising
+/// junk shouldn't break our netmap.
+fn parse_endpoints(addrs: &[String]) -> Vec<SocketAddr> {
+    addrs.iter().filter_map(|s| s.parse().ok()).collect()
+}
+
+fn parse_nodekey(s: &str) -> Option<NodeKeyBytes> {
+    parse_nodekey_with_prefix(s, "nodekey:")
+}
+
+fn parse_nodekey_with_prefix(s: &str, prefix: &str) -> Option<NodeKeyBytes> {
+    let hex = s.strip_prefix(prefix).unwrap_or(s);
+    decode_hex_32(hex)
+}
+
+fn decode_hex_32(hex: &str) -> Option<NodeKeyBytes> {
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, b) in out.iter_mut().enumerate() {
+        let s = hex.get(i * 2..i * 2 + 2)?;
+        *b = u8::from_str_radix(s, 16).ok()?;
+    }
+    Some(out)
+}
+
+fn parse_addrs(addrs: &[String]) -> Vec<AllowedIp> {
+    addrs.iter().filter_map(|a| parse_ipv4_cidr(a)).collect()
+}
+
+fn parse_ipv4_cidr(s: &str) -> Option<AllowedIp> {
+    let (ip, prefix) = s.split_once('/')?;
+    let addr: Ipv4Addr = ip.parse().ok()?;
+    let prefix: u8 = prefix.parse().ok()?;
+    if prefix > 32 {
+        return None;
+    }
+    Some(AllowedIp { addr, prefix })
+}
+
+/// Legacy DERP magic string `"127.3.3.40:<region>"` (used by older capvers
+/// before the `HomeDERP` int field). Returns the region.
+fn parse_legacy_derp(s: &str) -> Option<u16> {
+    let (_, port) = s.rsplit_once(':')?;
+    port.parse().ok()
+}
+
+fn parse_derp_regions(dmap: &DerpMapWire) -> HashMap<u16, DerpRegionSnapshot> {
+    dmap.regions
+        .values()
+        .map(|r| {
+            let nodes = r
+                .nodes
+                .iter()
+                .map(|n| DerpNodeSnapshot {
+                    name: n.name.clone(),
+                    region_id: n.region_id,
+                    hostname: n.hostname.clone(),
+                    ipv4: n.ipv4.clone(),
+                    ipv6: n.ipv6.clone(),
+                    derp_port: n.derp_port,
+                    stun_port: n.stun_port,
+                })
+                .collect();
+            (
+                r.region_id,
+                DerpRegionSnapshot {
+                    region_id: r.region_id,
+                    region_code: r.region_code.clone(),
+                    region_name: r.region_name.clone(),
+                    nodes,
+                },
+            )
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{MapResponseWire, NodeWire, PeerChangeWire, UserProfileWire};
+
+    fn node(id: i64, hex_byte: u8, addr: &str) -> NodeWire {
+        NodeWire {
+            id,
+            name: format!("peer-{id}"),
+            key: format!("nodekey:{}", format!("{:02x}", hex_byte).repeat(32)),
+            addresses: vec![format!("{addr}/32")],
+            allowed_ips: vec![format!("{addr}/32")],
+            home_derp: 1,
+            ..Default::default()
+        }
+    }
+
+    fn key_bytes(byte: u8) -> NodeKeyBytes {
+        [byte; 32]
+    }
+
+    /// CapVer >= 112: control omits AllowedIPs when it equals Addresses.
+    /// An empty wire list must derive the route set from Addresses —
+    /// NOT produce a peer with zero AllowedIPs (which made every data
+    /// frame fall through to an exit node's 0.0.0.0/0; 2026-07-02 bug).
+    #[test]
+    fn omitted_allowed_ips_derives_from_addresses() {
+        let mut n = node(1, 0x11, "100.64.0.2");
+        n.allowed_ips = vec![]; // control omitted the field (V112+)
+        n.addresses = vec![
+            "100.64.0.2/32".into(),
+            "fd7a:115c:a1e0::1/128".into(), // v6 filtered out
+        ];
+        let snap = node_to_snapshot(&n).unwrap();
+        assert_eq!(
+            snap.allowed_ips,
+            vec![AllowedIp {
+                addr: "100.64.0.2".parse().unwrap(),
+                prefix: 32
+            }]
+        );
+    }
+
+    /// When control DOES send AllowedIPs (exit nodes, subnet routers),
+    /// the explicit list wins verbatim — no derivation.
+    #[test]
+    fn explicit_allowed_ips_used_verbatim() {
+        let mut n = node(1, 0x11, "100.64.0.2");
+        n.allowed_ips = vec!["100.64.0.2/32".into(), "0.0.0.0/0".into()];
+        let snap = node_to_snapshot(&n).unwrap();
+        assert_eq!(snap.allowed_ips.len(), 2);
+        assert!(snap.allowed_ips.iter().any(|a| a.prefix == 0));
+    }
+
+    #[test]
+    fn apply_full_peers_replace() {
+        let mut nm = NetMap::default();
+        let resp = MapResponseWire {
+            seq: 1,
+            peers: Some(vec![
+                node(1, 0x11, "100.64.0.2"),
+                node(2, 0x22, "100.64.0.3"),
+            ]),
+            ..Default::default()
+        };
+        let delta = nm.apply(&resp);
+        assert_eq!(delta.upserted.len(), 2);
+        assert_eq!(nm.peers.len(), 2);
+        assert!(nm.peers.contains_key(&key_bytes(0x11)));
+        assert!(nm.peers.contains_key(&key_bytes(0x22)));
+    }
+
+    #[test]
+    fn apply_full_peers_replace_drops_old() {
+        let mut nm = NetMap::default();
+        nm.apply(&MapResponseWire {
+            peers: Some(vec![
+                node(1, 0x11, "100.64.0.2"),
+                node(2, 0x22, "100.64.0.3"),
+            ]),
+            ..Default::default()
+        });
+        let delta = nm.apply(&MapResponseWire {
+            peers: Some(vec![node(2, 0x22, "100.64.0.3")]),
+            ..Default::default()
+        });
+        assert_eq!(nm.peers.len(), 1);
+        assert_eq!(delta.removed, vec![key_bytes(0x11)]);
+        assert_eq!(delta.upserted.len(), 1);
+    }
+
+    #[test]
+    fn apply_peers_changed_upsert() {
+        let mut nm = NetMap::default();
+        nm.apply(&MapResponseWire {
+            peers: Some(vec![node(1, 0x11, "100.64.0.2")]),
+            ..Default::default()
+        });
+        let delta = nm.apply(&MapResponseWire {
+            peers_changed: Some(vec![node(2, 0x22, "100.64.0.3")]),
+            ..Default::default()
+        });
+        assert_eq!(nm.peers.len(), 2);
+        assert_eq!(delta.upserted.len(), 1);
+        assert_eq!(delta.upserted[0].node_id, 2);
+    }
+
+    #[test]
+    fn apply_peers_removed_drops() {
+        let mut nm = NetMap::default();
+        nm.apply(&MapResponseWire {
+            peers: Some(vec![
+                node(1, 0x11, "100.64.0.2"),
+                node(2, 0x22, "100.64.0.3"),
+            ]),
+            ..Default::default()
+        });
+        let delta = nm.apply(&MapResponseWire {
+            peers_removed: Some(vec![1]),
+            ..Default::default()
+        });
+        assert_eq!(delta.removed, vec![key_bytes(0x11)]);
+        assert_eq!(nm.peers.len(), 1);
+        assert!(nm.peers.contains_key(&key_bytes(0x22)));
+    }
+
+    #[test]
+    fn full_peer_picks_up_endpoints() {
+        let mut nm = NetMap::default();
+        let mut n = node(1, 0x11, "100.64.0.2");
+        n.endpoints = vec![
+            "192.0.2.1:41641".into(),
+            "[2001:db8::1]:41641".into(),
+            "garbage".into(), // dropped silently
+        ];
+        nm.apply(&MapResponseWire {
+            peers: Some(vec![n]),
+            ..Default::default()
+        });
+        let p = &nm.peers[&key_bytes(0x11)];
+        assert_eq!(p.endpoints.len(), 2);
+        assert_eq!(
+            p.endpoints[0],
+            "192.0.2.1:41641".parse::<SocketAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn apply_patch_endpoints_replaces() {
+        let mut nm = NetMap::default();
+        nm.apply(&MapResponseWire {
+            peers: Some(vec![node(7, 0x77, "100.64.0.7")]),
+            ..Default::default()
+        });
+        assert!(nm.peers[&key_bytes(0x77)].endpoints.is_empty());
+
+        let delta = nm.apply(&MapResponseWire {
+            peers_changed_patch: Some(vec![PeerChangeWire {
+                node_id: 7,
+                endpoints: Some(vec!["10.0.0.1:41641".into()]),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        });
+        assert_eq!(delta.patches_applied, 1);
+        let eps = &nm.peers[&key_bytes(0x77)].endpoints;
+        assert_eq!(eps.len(), 1);
+        assert_eq!(eps[0], "10.0.0.1:41641".parse::<SocketAddr>().unwrap());
+    }
+
+    #[test]
+    fn apply_patch_home_derp_change() {
+        let mut nm = NetMap::default();
+        nm.apply(&MapResponseWire {
+            peers: Some(vec![node(7, 0x77, "100.64.0.7")]),
+            ..Default::default()
+        });
+        let delta = nm.apply(&MapResponseWire {
+            peers_changed_patch: Some(vec![PeerChangeWire {
+                node_id: 7,
+                home_derp: Some(42),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        });
+        assert_eq!(delta.patches_applied, 1);
+        assert_eq!(nm.peers[&key_bytes(0x77)].home_derp, 42);
+    }
+
+    #[test]
+    fn apply_patch_rekey_swaps_node_key() {
+        let mut nm = NetMap::default();
+        nm.apply(&MapResponseWire {
+            peers: Some(vec![node(7, 0x77, "100.64.0.7")]),
+            ..Default::default()
+        });
+        let new_key = format!("nodekey:{}", "ab".repeat(32));
+        let delta = nm.apply(&MapResponseWire {
+            peers_changed_patch: Some(vec![PeerChangeWire {
+                node_id: 7,
+                key: Some(new_key.clone()),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        });
+        assert_eq!(delta.rekeyed.len(), 1);
+        assert_eq!(delta.rekeyed[0].old_key, key_bytes(0x77));
+        assert_eq!(delta.rekeyed[0].snapshot.node_key, [0xabu8; 32]);
+        assert!(!nm.peers.contains_key(&key_bytes(0x77)));
+        assert!(nm.peers.contains_key(&[0xabu8; 32]));
+        assert_eq!(nm.id_to_key[&7], [0xabu8; 32]);
+    }
+
+    #[test]
+    fn apply_patch_unknown_node_id_warns_and_skips() {
+        let mut nm = NetMap::default();
+        let delta = nm.apply(&MapResponseWire {
+            peers_changed_patch: Some(vec![PeerChangeWire {
+                node_id: 999,
+                home_derp: Some(5),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        });
+        assert_eq!(delta.patches_applied, 0);
+        assert_eq!(delta.patches_skipped_unknown_node_id, 1);
+    }
+
+    #[test]
+    fn apply_records_our_addrs_from_node() {
+        let mut nm = NetMap::default();
+        let resp = MapResponseWire {
+            node: Some(NodeWire {
+                id: 1,
+                addresses: vec!["100.64.0.1/32".into(), "fd7a:115c:a1e0::1/128".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let delta = nm.apply(&resp);
+        assert!(delta.our_addrs_changed);
+        // IPv6 is filtered out; only IPv4 makes it through parse_ipv4_cidr.
+        assert_eq!(nm.our_addrs.len(), 1);
+        assert_eq!(nm.our_addrs[0].addr, Ipv4Addr::new(100, 64, 0, 1));
+    }
+
+    fn profile(id: i64, login: &str) -> UserProfileWire {
+        UserProfileWire {
+            id,
+            login_name: login.into(),
+            ..Default::default()
+        }
+    }
+
+    /// M19: `UserProfiles` is a delta — control sends only new/changed
+    /// profiles per frame. A profile-less (peers-only / no-change) frame
+    /// must not blank the accumulated map, and a new profile upserts
+    /// alongside the old rather than replacing the set.
+    #[test]
+    fn user_profiles_delta_merge_survives_profileless_frames() {
+        let mut nm = NetMap::default();
+        nm.apply(&MapResponseWire {
+            user_profiles: vec![profile(1, "a@b")],
+            ..Default::default()
+        });
+        assert_eq!(nm.user_profiles.len(), 1);
+
+        // A peers-only frame carries no profiles → prior identity survives.
+        nm.apply(&MapResponseWire {
+            peers_changed: Some(vec![node(2, 0x22, "100.64.0.3")]),
+            ..Default::default()
+        });
+        assert_eq!(nm.user_profiles.len(), 1);
+        assert_eq!(nm.user_profiles[&1].login_name, "a@b");
+
+        // A new profile upserts alongside, doesn't replace.
+        nm.apply(&MapResponseWire {
+            user_profiles: vec![profile(2, "c@d")],
+            ..Default::default()
+        });
+        assert_eq!(nm.user_profiles.len(), 2);
+        assert_eq!(nm.user_profiles[&1].login_name, "a@b");
+        assert_eq!(nm.user_profiles[&2].login_name, "c@d");
+    }
+
+    /// The self user ID and its `UserProfile` can land in different
+    /// frames (either order). `our_login_name` resolves lazily once both
+    /// have arrived.
+    #[test]
+    fn our_login_name_resolves_out_of_order() {
+        // Profile-first: id unknown → None, then self Node arrives.
+        let mut nm = NetMap::default();
+        nm.apply(&MapResponseWire {
+            user_profiles: vec![profile(7, "dave@example.com")],
+            ..Default::default()
+        });
+        assert_eq!(nm.our_login_name(), None);
+        nm.apply(&MapResponseWire {
+            node: Some(NodeWire {
+                id: 1,
+                user: 7,
+                addresses: vec!["100.64.0.1/32".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert_eq!(nm.our_user_id, Some(7));
+        assert_eq!(nm.our_login_name(), Some("dave@example.com"));
+
+        // Id-first: self Node arrives before the profile does.
+        let mut nm2 = NetMap::default();
+        nm2.apply(&MapResponseWire {
+            node: Some(NodeWire {
+                id: 1,
+                user: 7,
+                addresses: vec!["100.64.0.1/32".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert_eq!(nm2.our_login_name(), None);
+        nm2.apply(&MapResponseWire {
+            user_profiles: vec![profile(7, "dave@example.com")],
+            ..Default::default()
+        });
+        assert_eq!(nm2.our_login_name(), Some("dave@example.com"));
+    }
+
+    /// Tagged nodes point `Node.User` at a tag pseudo-user with no human
+    /// login name — whether the profile is absent or carries an empty
+    /// `LoginName`, `our_login_name` returns None (UI falls back to
+    /// hostname).
+    #[test]
+    fn our_login_name_none_for_tagged_or_missing_profile() {
+        let mut nm = NetMap::default();
+        nm.apply(&MapResponseWire {
+            node: Some(NodeWire {
+                id: 1,
+                user: 99,
+                addresses: vec!["100.64.0.1/32".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert_eq!(nm.our_user_id, Some(99));
+        // No profile for user 99 yet → None.
+        assert_eq!(nm.our_login_name(), None);
+        // A tag pseudo-user profile (empty LoginName) → still None.
+        nm.apply(&MapResponseWire {
+            user_profiles: vec![UserProfileWire {
+                id: 99,
+                login_name: String::new(),
+                display_name: "tagged-devices".into(),
+            }],
+            ..Default::default()
+        });
+        assert_eq!(nm.our_login_name(), None);
+    }
+
+    /// `our_user_id` uses the same guard as `our_key_expiry`: a self Node
+    /// that omits `User` (== 0) or a peers-only frame must not blank a
+    /// previously-learned id.
+    #[test]
+    fn our_user_id_guarded_against_blanking() {
+        let mut nm = NetMap::default();
+        nm.apply(&MapResponseWire {
+            node: Some(NodeWire {
+                id: 1,
+                user: 7,
+                addresses: vec!["100.64.0.1/32".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert_eq!(nm.our_user_id, Some(7));
+        // Self Node frame omitting User (user == 0) → preserved.
+        nm.apply(&MapResponseWire {
+            node: Some(NodeWire {
+                id: 1,
+                addresses: vec!["100.64.0.1/32".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert_eq!(nm.our_user_id, Some(7));
+        // Peers-only frame (no self Node) → preserved.
+        nm.apply(&MapResponseWire {
+            peers_changed: Some(vec![node(2, 0x22, "100.64.0.3")]),
+            ..Default::default()
+        });
+        assert_eq!(nm.our_user_id, Some(7));
+    }
+
+    /// S2 must not disturb Domain capture: a later profile-only frame
+    /// (empty Domain) leaves the learned domain intact.
+    #[test]
+    fn user_profiles_frame_leaves_domain_untouched() {
+        let mut nm = NetMap::default();
+        nm.apply(&MapResponseWire {
+            domain: "example.com".into(),
+            ..Default::default()
+        });
+        assert_eq!(nm.domain, "example.com");
+        nm.apply(&MapResponseWire {
+            user_profiles: vec![profile(1, "a@b")],
+            ..Default::default()
+        });
+        assert_eq!(nm.domain, "example.com");
+    }
+
+    #[test]
+    fn apply_seq_advances_monotonically() {
+        let mut nm = NetMap::default();
+        nm.apply(&MapResponseWire {
+            seq: 5,
+            ..Default::default()
+        });
+        assert_eq!(nm.last_seq, 5);
+        nm.apply(&MapResponseWire {
+            seq: 3,
+            ..Default::default()
+        });
+        // Older seqs don't reset us.
+        assert_eq!(nm.last_seq, 5);
+    }
+
+    #[test]
+    fn packet_filter_parses_and_absent_delta_retains_it() {
+        let mut nm = NetMap::default();
+        let initial: MapResponseWire = serde_json::from_slice(
+            br#"{
+            "PacketFilter":[{
+                "SrcIPs":["100.64.0.2/32"],
+                "DstPorts":[{"IP":"100.64.0.1","Ports":{"First":8080,"Last":8080}}],
+                "IPProto":[6]
+            }]
+        }"#,
+        )
+        .unwrap();
+        let delta = nm.apply(&initial);
+        assert!(delta.packet_filter_changed);
+        assert_eq!(
+            nm.packet_filter,
+            Some(PacketFilter::Rules(vec![FilterRule {
+                src_ips: vec![AllowedIp {
+                    addr: "100.64.0.2".parse().unwrap(),
+                    prefix: 32
+                }],
+                dst_ports: vec![NetPortRange {
+                    ip: AllowedIp {
+                        addr: "100.64.0.1".parse().unwrap(),
+                        prefix: 32
+                    },
+                    port_first: 8080,
+                    port_last: 8080,
+                }],
+                ip_protocols: vec![6],
+            }]))
+        );
+
+        let delta = nm.apply(&MapResponseWire::default());
+        assert!(!delta.packet_filter_changed);
+        assert!(matches!(nm.packet_filter, Some(PacketFilter::Rules(_))));
+    }
+
+    #[test]
+    fn packet_filter_null_means_unchanged() {
+        let mut nm = NetMap::default();
+        let wire: MapResponseWire = serde_json::from_slice(br#"{"PacketFilter":null}"#).unwrap();
+        let delta = nm.apply(&wire);
+        assert!(!delta.packet_filter_changed);
+        assert_eq!(nm.packet_filter, None);
+    }
+
+    #[test]
+    fn parse_legacy_derp_works() {
+        assert_eq!(parse_legacy_derp("127.3.3.40:5"), Some(5));
+        assert_eq!(parse_legacy_derp(""), None);
+    }
+}
