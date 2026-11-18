@@ -1,0 +1,34 @@
+[package]
+name = "tailnet-listener"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Forwards tailnet TCP connections to the Vita companion's loopback FTP (1337) and command (1338) services."
+
+[dependencies]
+# All tailscale-vita crates come from one pinned upstream revision.
+tailscale-vita = { git = "https://github.com/koalabuttz/tailscale-vita", rev = "88a992c" }
+netstack       = { git = "https://github.com/koalabuttz/tailscale-vita", rev = "88a992c" }
+vita-log       = { git = "https://github.com/koalabuttz/tailscale-vita", rev = "88a992c" }
+vita-fs        = { git = "https://github.com/koalabuttz/tailscale-vita", rev = "88a992c" }
+
+serde = { version = "1", features = ["derive"] }
+toml  = { version = "0.8", default-features = false, features = ["parse"] }
+
+[package.metadata.vita]
+title_id   = "TVIT00011"
+title_name = "Tailnet Listener"
+vita_make_fself_flags = []
+
+# Matches the upstream workspace's release profile (the runtime is tested
+# with panic=unwind + fat LTO on hardware).
+[profile.release]
+panic     = "unwind"
+lto       = true
+opt-level = 2
+
+# `[patch]` in a git dependency's workspace does not apply to consumers, so
+# repeat upstream's ring patch here. Without it ring has no Vita target support.
+[patch.crates-io]
+ring = { git = "https://github.com/vita-rust/ring", branch = "v0.17.14-vita" }
