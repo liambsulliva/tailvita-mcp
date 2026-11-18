@@ -16,6 +16,9 @@ include("${VITASDK}/share/vita.cmake" REQUIRED)
 set(VITACOMPANION_FTP_PORT 1337 CACHE STRING "FTP control port")
 set(VITACOMPANION_CMD_PORT 1338 CACHE STRING "Command server port")
 set(VITACOMPANION_MODULE_NAME "vitacompanion" CACHE STRING "Vita module name")
+# Memory budget, per vitacompanion-slim: SceShell plugins share one budget.
+set(VITACOMPANION_POOL_SIZE 1048576 CACHE STRING "Companion heap reserved in SceShell, in bytes")
+set(VITACOMPANION_FTP_BUFFER_SIZE 65536 CACHE STRING "Per-transfer FTP file buffer, in bytes")
 option(VITACOMPANION_ENABLE_LOGGING
   "Compile VitaCompanion and FTP logging support" OFF)
 
@@ -32,6 +35,18 @@ endif()
 if(NOT VITACOMPANION_CMD_PORT MATCHES "^[0-9]+$" OR
    VITACOMPANION_CMD_PORT LESS 1 OR VITACOMPANION_CMD_PORT GREATER 65535)
   message(FATAL_ERROR "VITACOMPANION_CMD_PORT must be between 1 and 65535")
+endif()
+if(NOT VITACOMPANION_POOL_SIZE MATCHES "^[0-9]+$" OR VITACOMPANION_POOL_SIZE LESS 65536)
+  message(FATAL_ERROR "VITACOMPANION_POOL_SIZE must be at least 65536")
+endif()
+# libftpvita allocates FTPVITA_TRANSFER_POOL_SLOTS (4) buffers up front from
+# the heap, so all of them must fit with room to spare.
+if(NOT VITACOMPANION_FTP_BUFFER_SIZE MATCHES "^[0-9]+$" OR VITACOMPANION_FTP_BUFFER_SIZE LESS 4096)
+  message(FATAL_ERROR "VITACOMPANION_FTP_BUFFER_SIZE must be at least 4096")
+endif()
+math(EXPR VITACOMPANION_FTP_POOL_BYTES "${VITACOMPANION_FTP_BUFFER_SIZE} * 4")
+if(NOT VITACOMPANION_FTP_POOL_BYTES LESS VITACOMPANION_POOL_SIZE)
+  message(FATAL_ERROR "4 x VITACOMPANION_FTP_BUFFER_SIZE must be smaller than VITACOMPANION_POOL_SIZE")
 endif()
 if(NOT VITACOMPANION_MODULE_NAME MATCHES "^[A-Za-z0-9_]+$")
   message(FATAL_ERROR "VITACOMPANION_MODULE_NAME must contain only letters, digits, and underscores")
@@ -132,6 +147,8 @@ target_compile_definitions(ftpvita PRIVATE
 target_compile_definitions(vitacompanion PRIVATE
   CMD_PORT=${VITACOMPANION_CMD_PORT}
   ENABLE_LOGGING=${VITACOMPANION_LOGGING_VALUE}
+  POOL_SIZE=${VITACOMPANION_POOL_SIZE}
+  FTP_BUFFER_SIZE=${VITACOMPANION_FTP_BUFFER_SIZE}
 )
 
 add_dependencies(vitacompanion vitacompanion_kernel_stubs)

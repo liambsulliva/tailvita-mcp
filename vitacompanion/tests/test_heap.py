@@ -456,7 +456,7 @@ class HeapIntegrationTests(unittest.TestCase):
         ):
             self.assertNotIn(legacy, main)
 
-        heap_start = main.index("heap_init(1 * 1024 * 1024)")
+        heap_start = main.index("heap_init(POOL_SIZE)")
         input_start = main.index("input_start()")
         self.assertLess(heap_start, input_start)
 

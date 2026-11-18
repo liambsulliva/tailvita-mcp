@@ -464,7 +464,7 @@ class ProductionTransferPoolIntegrationTests(unittest.TestCase):
         self.assertIn("vendor/libftpvita/transfer_pool.c", cmake)
         self.assertIn("vendor/libftpvita/transfer_pool.h", cmake)
         self.assertIn("vendor/libftpvita/unicode_upper_table.h", cmake)
-        self.assertIn("ftpvita_set_file_buf_size(64 * 1024)", net)
+        self.assertIn("ftpvita_set_file_buf_size(FTP_BUFFER_SIZE)", net)
         self.assertIn("ftpvita_transfer_pool_init(file_buf_size)", ftp)
         self.assertIn("ftpvita_transfer_pool_fini()", ftp)
         self.assertIn("450 Transfer slot unavailable; retry later.", ftp)

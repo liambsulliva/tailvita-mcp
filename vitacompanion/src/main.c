@@ -28,7 +28,8 @@ int __unused module_start(SceSize argc, const void* args)
     (void)argc;
     (void)args;
 
-    result = heap_init(1 * 1024 * 1024);
+    // SceShell plugins share one budget; size via VITACOMPANION_POOL_SIZE.
+    result = heap_init(POOL_SIZE);
     if (result < 0)
         return result;
 

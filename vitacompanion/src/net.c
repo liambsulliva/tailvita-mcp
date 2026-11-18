@@ -2,6 +2,7 @@
 
 #include "cmd.h"
 #include "log.h"
+#include "main.h"
 
 #include <ftpvita.h>
 #include <vitasdk.h>
@@ -70,7 +71,7 @@ static void do_net_connected()
     ftpvita_set_debug_log_cb(LOG_CALLBACK);
 #endif
 
-    ftpvita_set_file_buf_size(64 * 1024);
+    ftpvita_set_file_buf_size(FTP_BUFFER_SIZE);
 
     if (ftpvita_init(vita_ip, &vita_port) >= 0)
     {
