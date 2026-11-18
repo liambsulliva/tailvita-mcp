@@ -30,8 +30,8 @@ int __unused module_start(SceSize argc, const void* args)
     if (result < 0)
         return result;
 
-    // Required for ftpvita
-    result = taipool_init(1 * 1024 * 1024);
+    // Required for ftpvita. SceShell plugins share one budget; size via VITACOMPANION_POOL_SIZE.
+    result = taipool_init(POOL_SIZE);
     if (result < 0)
     {
         input_end();
