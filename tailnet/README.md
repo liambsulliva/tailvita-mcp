@@ -73,49 +73,112 @@ counts and free user, CDRAM and phycont memory.
 ## Background service (`daemon/`, TVIT00013 and TVIT00014)
 
 The same listener, packaged so it keeps running with no app open and beside
-a game. `daemon/build.sh` builds one VPK with one bubble, **Tailnet Daemon**:
+any game. `daemon/build.sh` builds one VPK with one bubble, **Tailnet
+Daemon**:
 
 | Part | What it is |
 | --- | --- |
 | `eboot.bin` (TVIT00013) | `launcher.c`. Opened normally it starts the service and exits; it has no screen. Opened with **L held** it stops the service. |
-| `eboot2.bin` (TVIT00014) | The listener built with `--features daemon`: a 2 MiB newlib heap inside a 12 MiB SELF budget. |
-| `tailnet_shell.suprx` | `shell_module.c`, loaded into SceShell at run time by the launcher. Nothing is written under `ur0:tai`; it is gone after a reboot. |
+| `eboot2.bin` (TVIT00014) | The listener built with `--features daemon`: a 2 MiB newlib heap inside a 15 MiB SELF budget. |
+| `tailnet_shell.suprx` | `shell_module.c`, loaded into SceShell at run time by the launcher. |
+| `tailnet_capture.skprx` | `capture_kernel.c`, a kernel helper loaded at run time by the launcher. It reads the frame on screen for the screenshot port. |
+
+Nothing is written under `ur0:tai` and nothing loads at boot: after a
+reboot, open the bubble once.
+
+### Staying up beside a game
 
 The Vita ends every background service when an enlarged-memory game starts
 (Ghost Trick is one), and SceShell then refuses to start one beside the game.
 The SceShell module does two things about that. Its launch hook (the one
 GrapheneCt's LowMemMode installs) makes the refused start pass. Its watchdog
-starts the service again once it has been gone for 15 s, while
-`ux0:data/tailnet-listener/keepalive` exists; the launcher writes that file
-on a normal start and removes it on an L-held stop.
+checks every 5 s and starts the service again once it has been gone for
+15 s, while `ux0:data/tailnet-listener/keepalive` exists; the launcher writes
+that file on a normal start and removes it on an L-held stop. Measured: the
+tailnet is back about 25 s after a game launch, with nobody touching the
+Vita.
 
 The app (TVIT00011) and the service share one node key and one log, so only
 one may run: each binds `127.0.0.1:41338` and the second one exits with
 `listener.already_running`. Close the app before starting the service. The
-launcher's steps go to `ux0:data/tailnet-listener/launcher.log`.
+launcher's and the SceShell module's steps go to
+`ux0:data/tailnet-listener/launcher.log`.
 
-Install it from VitaShell (`ux0:/vpk/tailnet-daemon.vpk`), and reinstall
-after every rebuild: the system binds the service's SELF at install time.
+### Screenshots (port 1339)
 
-Measured on the Vita on 2026-11-20, first build (16 MiB budget, 6 MiB heap,
-started by hand, no watchdog):
+The system screenshot (PS + Start) is no use beside a game: taken while an
+enlarged-memory game is loaded, in front or suspended, it makes the system
+end the service every time. PS alone does not, and neither does a system
+screenshot with no game loaded.
 
-- On LiveArea with no app open, the tailnet answered 20 s after the bubble
-  was opened.
-- Starting Ghost Trick ended the service (its log stops there). Opening the
-  bubble again with the game suspended started it beside the game, and with
-  the game in front `status`, a command and a file pull all worked. Ghost
-  Trick's own log showed 170 MB of main memory free at the time.
-- Inside its budget the service had 3.0 MiB free at start and 2.0 MiB once
-  every thread was up; the heap peaked at 1.06 MiB used.
-- The system screenshot (PS + Start, sent through the command port) fired,
-  and the service died within a second of it. No crash dump was written, so
-  the system ended it. Cause not yet known; the smaller budget and the
-  watchdog in the current build are the first two things to try.
-- The first time the bubble was opened after the game had ended the
-  service, the Vita said its saved data was corrupt and offered to delete
-  it. Answering yes let it start. Cause not yet known.
+So the service has its own screenshot port, `capture_port` (1339), on the
+LAN and the tailnet. Connect, optionally send `jpeg <quality>` (1-100,
+default 80), and read `OK jpeg <width> <height>` followed by the JPEG until
+the connection closes, or `ERR <reason>`. The frame goes from the screen to
+the socket; nothing is stored on the Vita. `~/.dotagents/bin/vita screenshot`
+uses this port first.
 
-Not yet run on the Vita: the 12 MiB budget, the watchdog, and the L-held
-stop.
+How it works: `tailnet_capture.skprx` asks the display driver which
+framebuffer is on screen and copies it out of the owning process into a
+2 MiB block the service holds only while a picture is being sent
+(`src/capture.rs`). The service encodes it 16 rows at a time.
 
+Two things learned the hard way:
+
+- A process can only call the helper if it started after the helper was
+  loaded. The launcher loads it and must not call it; it writes
+  `capture2-ready` (boot time and SceShell's pid) so it loads the helper
+  once per boot, and the service offers the port only when that file exists.
+- A small negative return value from a syscall reaches the caller with bit
+  30 cleared (-7 arrived as `0xBFFFFFF9`), so the helper returns SCE-style
+  `0x80F7xxxx` codes. Its first version also asked the kernel for a 2 MiB
+  block and was refused; the current one allocates nothing.
+
+A kernel module cannot be replaced without a reboot. If the helper's
+interface changes, bump the `2` in `tailnet_capture.yml` and in
+`capture2-ready`, so the new one loads beside the old.
+
+### Install and stop
+
+Over the LAN, `vita install tailnet/daemon/build/tailnet-daemon.vpk` works
+(6 s). Away from home, `vita put` it to `ux0:/vpk/` and install it in
+VitaShell. Reinstall after every rebuild: the system binds the service's
+SELF at install time. Then open the bubble; `vita launch TVIT00013` does
+that too, but only from the home screen (with a game in front the launch is
+ignored).
+
+Files that switch things off, in `ux0:data/tailnet-listener/`:
+`no-shell-module` (the launcher leaves SceShell alone), `no-capture` (the
+kernel helper is not loaded), `stop` (the service exits; the launcher
+removes it on a normal start).
+
+If something goes wrong: the bubble's parts live only in memory, so a
+restart of the Vita removes the SceShell module and the kernel helper, and
+nothing starts again until the bubble is opened. To keep it from starting,
+do not open the bubble, or delete the bubble.
+
+### Measured on the Vita (2026-11-20)
+
+- On LiveArea with no app open, the tailnet answers 12-20 s after the bubble
+  is opened.
+- With Ghost Trick in front, over the tailnet: `status`, a command, a file
+  pull and a screenshot all work, and the service stays up. A screenshot is
+  88-128 KB and takes 0.5 s on the LAN and 1.3-3 s over the tailnet.
+- Inside a 16 MiB budget with a 6 MiB heap the service had 3.0 MiB free at
+  start and 2.0 MiB once every thread was up; the heap peaked at 1.06 MiB
+  used. Ghost Trick's own log showed 170 MB of its main memory free with the
+  service running.
+- One start took 110 s to come online instead of 20: Tailscale's control
+  server answered the map request after 82 s. Not seen again.
+
+Open:
+
+- Once, starts by the watchdog reported success six times in a row and the
+  service never came up (no log line, no crash dump); opening the bubble
+  fixed it. Cause unknown. The watchdog now stops after 4 such starts
+  (that module is replaced at the next reboot).
+- The first time the bubble was opened after a game had ended the service,
+  the Vita said its saved data was corrupt and offered to delete it.
+  Answering yes let it start. Not seen since.
+- Not yet tested: sleep and wake, a Wi-Fi drop, a one-hour soak, and a
+  phone hotspot with this build.
