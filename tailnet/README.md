@@ -68,4 +68,54 @@ counts and free user, CDRAM and phycont memory.
 - Each port keeps `listen_pool` sockets listening (default `max_conns`, at most 4): that many
   connections can arrive at the same moment. The defaults hold 2 on 1337 and 4 on 1338,
   6 × 32 KiB in all.
-- The newlib heap size is left at the default, the same as the demo.
+- The newlib heap size is left at the default, the same as the demo (app build).
+
+## Background service (`daemon/`, TVIT00013 and TVIT00014)
+
+The same listener, packaged so it keeps running with no app open and beside
+a game. `daemon/build.sh` builds one VPK with one bubble, **Tailnet Daemon**:
+
+| Part | What it is |
+| --- | --- |
+| `eboot.bin` (TVIT00013) | `launcher.c`. Opened normally it starts the service and exits; it has no screen. Opened with **L held** it stops the service. |
+| `eboot2.bin` (TVIT00014) | The listener built with `--features daemon`: a 2 MiB newlib heap inside a 12 MiB SELF budget. |
+| `tailnet_shell.suprx` | `shell_module.c`, loaded into SceShell at run time by the launcher. Nothing is written under `ur0:tai`; it is gone after a reboot. |
+
+The Vita ends every background service when an enlarged-memory game starts
+(Ghost Trick is one), and SceShell then refuses to start one beside the game.
+The SceShell module does two things about that. Its launch hook (the one
+GrapheneCt's LowMemMode installs) makes the refused start pass. Its watchdog
+starts the service again once it has been gone for 15 s, while
+`ux0:data/tailnet-listener/keepalive` exists; the launcher writes that file
+on a normal start and removes it on an L-held stop.
+
+The app (TVIT00011) and the service share one node key and one log, so only
+one may run: each binds `127.0.0.1:41338` and the second one exits with
+`listener.already_running`. Close the app before starting the service. The
+launcher's steps go to `ux0:data/tailnet-listener/launcher.log`.
+
+Install it from VitaShell (`ux0:/vpk/tailnet-daemon.vpk`), and reinstall
+after every rebuild: the system binds the service's SELF at install time.
+
+Measured on the Vita on 2026-11-20, first build (16 MiB budget, 6 MiB heap,
+started by hand, no watchdog):
+
+- On LiveArea with no app open, the tailnet answered 20 s after the bubble
+  was opened.
+- Starting Ghost Trick ended the service (its log stops there). Opening the
+  bubble again with the game suspended started it beside the game, and with
+  the game in front `status`, a command and a file pull all worked. Ghost
+  Trick's own log showed 170 MB of main memory free at the time.
+- Inside its budget the service had 3.0 MiB free at start and 2.0 MiB once
+  every thread was up; the heap peaked at 1.06 MiB used.
+- The system screenshot (PS + Start, sent through the command port) fired,
+  and the service died within a second of it. No crash dump was written, so
+  the system ended it. Cause not yet known; the smaller budget and the
+  watchdog in the current build are the first two things to try.
+- The first time the bubble was opened after the game had ended the
+  service, the Vita said its saved data was corrupt and offered to delete
+  it. Answering yes let it start. Cause not yet known.
+
+Not yet run on the Vita: the 12 MiB budget, the watchdog, and the L-held
+stop.
+

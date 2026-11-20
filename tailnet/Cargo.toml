@@ -41,3 +41,5 @@ ring = { git = "https://github.com/vita-rust/ring", branch = "v0.17.14-vita" }
 # ts-control with the packet-filter IP-range fix (vendor/ts-control/PATCHES.md).
 [patch."https://github.com/koalabuttz/tailscale-vita"]
 ts-control = { path = "vendor/ts-control" }
+# wg-engine with per-packet log lines at debug (vendor/wg-engine/PATCHES.md).
+wg-engine  = { path = "vendor/wg-engine" }

@@ -1,4 +1,4 @@
-tailnet_lowmem:
+tailnet_shell:
   attributes: 0
   version:
     major: 1

@@ -1603,7 +1603,6 @@ dependencies = [
 [[package]]
 name = "wg-engine"
 version = "0.1.0"
-source = "git+https://github.com/koalabuttz/tailscale-vita?rev=88a992c#88a992c28a7a904b100d62f54877654bf973862a"
 dependencies = [
  "arc-swap",
  "base64 0.22.1",

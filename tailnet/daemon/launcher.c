@@ -1,20 +1,24 @@
 /* Tailnet Daemon launcher (eboot.bin, the visible bubble).
  *
- * Starts the background service (eboot2.bin in this package: the tailnet
- * listener built with the `daemon` feature) and exits. The service keeps
- * running with no app open, until its LiveArea card is peeled off.
+ * Opened normally, it starts the background service (eboot2.bin in this
+ * package: the tailnet listener built with the `daemon` feature) and exits.
+ * The service keeps running with no app open.
  *
- * Before that it loads tailnet_lowmem.suprx into SceShell, so the service
- * can also be started while an enlarged-memory game is running: starting
- * such a game ends every background service, and without the hook SceShell
- * refuses to start one again beside it. The module is loaded at run time
- * with taiHEN; nothing is written under ur0:tai.
+ * Opened with L held, it stops the service and tells the watchdog to leave
+ * it stopped.
+ *
+ * Before starting the service it loads tailnet_shell.suprx into SceShell
+ * (shell_module.c). That module lets the service start while an
+ * enlarged-memory game is running, and starts it again when the system ends
+ * it. The module is loaded at run time with taiHEN; nothing is written under
+ * ur0:tai.
  *
  * There is no screen output. Each step goes to
  * ux0:data/tailnet-listener/launcher.log.
  */
 #include <psp2/appmgr.h>
 #include <psp2/bgapputil.h>
+#include <psp2/ctrl.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
 #include <psp2/kernel/clib.h>
@@ -26,10 +30,14 @@
 
 #define DIR_PATH "ux0:data/tailnet-listener"
 #define LOG_PATH DIR_PATH "/launcher.log"
-#define MOD_SRC  "app0:tailnet_lowmem.suprx"
-#define MOD_DST  DIR_PATH "/tailnet_lowmem.suprx"
+#define MOD_SRC  "app0:tailnet_shell.suprx"
+#define MOD_DST  DIR_PATH "/tailnet_shell.suprx"
 /* Leave SceShell alone when this file exists. */
-#define NO_HOOK  DIR_PATH "/no-lowmem"
+#define NO_HOOK  DIR_PATH "/no-shell-module"
+/* While this file exists the SceShell module restarts a service that died. */
+#define KEEP_PATH DIR_PATH "/keepalive"
+/* The service exits when it sees this file. */
+#define STOP_PATH DIR_PATH "/stop"
 
 static void say(const char *fmt, ...)
 {
@@ -70,7 +78,7 @@ static int copy_file(const char *src, const char *dst)
     return n < 0 ? n : total;
 }
 
-static void load_lowmem_hook(void)
+static void load_shell_module(void)
 {
     SceIoStat st;
     if (sceIoGetstat(NO_HOOK, &st) >= 0) {
@@ -79,7 +87,7 @@ static void load_lowmem_hook(void)
     }
     int n = copy_file(MOD_SRC, MOD_DST);
     if (n <= 0) {
-        say("launcher: copying the hook module failed (%08X)", (unsigned)n);
+        say("launcher: copying the shell module failed (%08X)", (unsigned)n);
         return;
     }
     SceUID shell = -1;
@@ -92,7 +100,27 @@ static void load_lowmem_hook(void)
         return;
     }
     SceUID mod = taiLoadStartModuleForPid(shell, MOD_DST, 0, NULL, 0);
-    say("launcher: hook module into SceShell pid %08X -> %08X", (unsigned)shell, (unsigned)mod);
+    say("launcher: shell module into SceShell pid %08X -> %08X", (unsigned)shell, (unsigned)mod);
+}
+
+static void touch(const char *path)
+{
+    SceUID fd = sceIoOpen(path, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0666);
+    if (fd >= 0)
+        sceIoClose(fd);
+}
+
+static int l_held(void)
+{
+    SceCtrlData pad;
+    /* The first reads after start can be empty; sample for a quarter second. */
+    for (int i = 0; i < 5; i++) {
+        sceClibMemset(&pad, 0, sizeof pad);
+        if (sceCtrlPeekBufferPositive(0, &pad, 1) >= 0 && (pad.buttons & SCE_CTRL_LTRIGGER))
+            return 1;
+        sceKernelDelayThread(50 * 1000);
+    }
+    return 0;
 }
 
 int main(void)
@@ -101,17 +129,28 @@ int main(void)
     sceIoMkdir(DIR_PATH, 0777);
     say("launcher: start (uptime %us)", (unsigned)(sceKernelGetSystemTimeWide() / 1000000ULL));
 
-    load_lowmem_hook();
+    if (l_held()) {
+        sceIoRemove(KEEP_PATH);
+        touch(STOP_PATH);
+        say("launcher: L held; service told to stop, restarts off");
+        sceKernelDelayThread(500 * 1000);
+        sceKernelExitProcess(0);
+        return 0;
+    }
+
+    sceIoRemove(STOP_PATH);
+    load_shell_module();
 
     int rc = sceSysmoduleLoadModule(SCE_SYSMODULE_BG_APP_UTIL);
     say("launcher: load BG_APP_UTIL -> %08X", (unsigned)rc);
-    /* BGFTP passes 0; VitaSDK's header says 1. Upstream's spike found 0 works. */
+    /* BGFTP passes 0; VitaSDK's header says 1. 0 works on firmware 3.65. */
     rc = sceBgAppUtilStartBgApp(0);
     say("launcher: StartBgApp(0) -> %08X", (unsigned)rc);
     if (rc < 0) {
         rc = sceBgAppUtilStartBgApp(1);
         say("launcher: StartBgApp(1) -> %08X", (unsigned)rc);
     }
+    touch(KEEP_PATH);
     say("launcher: exit");
     sceKernelDelayThread(500 * 1000);
     sceKernelExitProcess(0);

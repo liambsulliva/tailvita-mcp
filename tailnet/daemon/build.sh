@@ -1,7 +1,7 @@
 #!/bin/bash
 # Build the Tailnet Daemon package: one bubble, two programs.
 #
-#   eboot.bin   launcher (launcher.c): loads the SceShell hook, starts the
+#   eboot.bin   launcher (launcher.c): loads the SceShell module, starts the
 #               service, exits.
 #   eboot2.bin  the service: tailnet-listener built with `--features daemon`,
 #               in a SELF that carries a memory budget.
@@ -26,11 +26,14 @@ LAUNCHER_ID="TVIT00013"; LAUNCHER_TITLE="Tailnet Daemon"
 SERVICE_ID="TVIT00014";  SERVICE_TITLE="Tailnet Service"
 CONTENT_TAIL="TAILNETDAEMON000"
 
-# The service's budget, in KiB: the 3.0 MiB image, the 6 MiB newlib heap
-# (src/main.rs), about 2.4 MiB of thread stacks plus 96 KiB per connection,
-# and slack. 16 MiB is also what BGFTP's service declares, which is known to
-# start beside enlarged-memory games.
-MEMSIZE_KB=16384
+# The service's budget, in KiB. Measured on the Vita with a 6 MiB heap and a
+# 16 MiB budget: 3.0 MiB free at start, 2.0 MiB free once every thread was
+# up, so everything but the heap takes about 8.2 MiB (image, thread stacks,
+# network memory), plus 96 KiB per open connection. With the 2 MiB heap
+# (src/main.rs) that is about 11 MiB at full load; 12 MiB leaves 1 MiB spare.
+# A background service is the first thing the system ends when memory runs
+# short beside an enlarged-memory game, so smaller is safer.
+MEMSIZE_KB=12288
 ATTRIBUTE=3
 
 echo "==> service: cargo vita build (features: daemon)"
@@ -68,7 +71,7 @@ vita-pack-vpk \
   -b "$OUT/cmake/eboot.bin" \
   -a "$OUT/eboot2.bin=eboot2.bin" \
   -a "$OUT/param2.sfo=sce_sys/param2.sfo" \
-  -a "$OUT/cmake/tailnet_lowmem.suprx=tailnet_lowmem.suprx" \
+  -a "$OUT/cmake/tailnet_shell.suprx=tailnet_shell.suprx" \
   -a "$HERE/assets/icon0.png=sce_sys/icon0.png" \
   -a "$HERE/assets/bg0.png=sce_sys/livearea/contents/bg0.png" \
   -a "$HERE/assets/startup.png=sce_sys/livearea/contents/startup.png" \

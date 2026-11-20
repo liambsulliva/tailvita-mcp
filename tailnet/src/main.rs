@@ -42,12 +42,18 @@ const INSTANCE_LOCK_PORT: u16 = 41338;
 
 /// The background service's whole newlib heap. crt0 takes it before `main`,
 /// and it must fit in the service SELF's budget (daemon/build.sh, MEMSIZE)
-/// next to the image and the thread stacks. Measured use peaks near 1.2 MiB.
+/// next to the image and the thread stacks. Measured use peaks near 1.1 MiB
+/// (arena 1.2 MiB); `listener.status` logs both every minute.
 /// The app build keeps newlib's default.
 #[cfg(all(target_os = "vita", feature = "daemon"))]
 #[no_mangle]
 #[used]
-pub static _newlib_heap_size_user: u32 = 6 * 1024 * 1024;
+pub static _newlib_heap_size_user: u32 = 2 * 1024 * 1024;
+
+/// The launcher writes this file to stop the background service (hold L
+/// while opening the bubble). The app build ignores it.
+#[cfg(feature = "daemon")]
+const STOP_PATH: &str = "ux0:data/tailnet-listener/stop";
 
 const MODE: &str = if cfg!(feature = "daemon") { "daemon" } else { "app" };
 
@@ -177,6 +183,14 @@ fn run(loaded: Result<(ListenerConfig, bool), config::LoadError>) {
                 free_phycont_kb = m.phycont_kb,
                 "listener.status"
             );
+        }
+        #[cfg(feature = "daemon")]
+        if vita_fs::read(std::path::Path::new(STOP_PATH)).is_ok() {
+            // The runtime thread never returns by itself; leave it to the OS.
+            info!(path = STOP_PATH, "listener.stop_requested");
+            vita_log::flush();
+            thread::sleep(Duration::from_millis(300));
+            std::process::exit(0);
         }
         thread::sleep(Duration::from_secs(1));
     }

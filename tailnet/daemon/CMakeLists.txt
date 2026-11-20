@@ -19,20 +19,23 @@ target_link_libraries(launcher
   taihen_stub
   SceBgAppUtil_stub
   SceAppMgr_stub
+  SceCtrl_stub
   SceSysmodule_stub)
 vita_create_self(eboot.bin launcher UNSAFE MEMSIZE 4096)
 
 # The SceShell hook. After the launcher's SELF: vita.cmake's CONFIG argument
 # leaks into later vita_create_self calls.
-add_executable(tailnet_lowmem lowmem.c)
-target_compile_options(tailnet_lowmem PRIVATE -Wall -O2 -fno-pic -fno-PIC -std=gnu99)
-target_link_options(tailnet_lowmem PRIVATE -Wl,-q -nostdlib)
-target_link_libraries(tailnet_lowmem
+add_executable(tailnet_shell shell_module.c)
+target_compile_options(tailnet_shell PRIVATE -Wall -O2 -fno-pic -fno-PIC -std=gnu99)
+target_link_options(tailnet_shell PRIVATE -Wl,-q -nostdlib)
+target_link_libraries(tailnet_shell
   taihen_stub
   SceLibKernel_stub
   SceKernelModulemgr_stub
+  SceKernelThreadMgr_stub
   SceIofilemgr_stub
+  SceAppMgr_stub
   gcc)
-vita_create_self(tailnet_lowmem.suprx tailnet_lowmem
-  CONFIG ${CMAKE_CURRENT_SOURCE_DIR}/tailnet_lowmem.yml
+vita_create_self(tailnet_shell.suprx tailnet_shell
+  CONFIG ${CMAKE_CURRENT_SOURCE_DIR}/tailnet_shell.yml
   UNSAFE)
