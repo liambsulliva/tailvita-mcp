@@ -34,9 +34,6 @@ const RUNTIME_STACK: usize = 256 * 1024;
 const ACCEPT_STACK: usize = 64 * 1024;
 /// Per-listener accept wait inside the shared accept loop.
 const ACCEPT_SLICE: Duration = Duration::from_millis(100);
-/// Pre-allocated listening sockets per port (each holds 32 KiB of
-/// netstack buffers). Capped well below max_conns.
-const MAX_LISTEN_POOL: usize = 2;
 const SESSION_DRAIN: Duration = Duration::from_secs(5);
 const STATUS_EVERY: Duration = Duration::from_secs(60);
 
@@ -180,7 +177,7 @@ impl Session {
 
         let mut listeners = Vec::new();
         for f in &cfg.forwards {
-            let pool = f.max_conns.min(MAX_LISTEN_POOL);
+            let pool = f.listen_pool();
             match TcpListener::bind(rt.netstack(), f.port, pool) {
                 Ok(listener) => {
                     info!(port = f.port, pool, "listener.listen");

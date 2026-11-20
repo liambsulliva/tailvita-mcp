@@ -37,11 +37,23 @@ pub struct Forward {
     /// Concurrent tailnet connections allowed on this port.
     #[serde(default = "default_max_conns")]
     pub max_conns: usize,
+    /// Listening sockets kept ready on this port: how many connections can
+    /// arrive at the same moment. Each costs 32 KiB of netstack buffers.
+    /// Defaults to `max_conns`, capped at `MAX_LISTEN_POOL`.
+    #[serde(default)]
+    pub listen_pool: Option<usize>,
 }
+
+/// Most listening sockets one port may keep ready (4 × 32 KiB).
+pub const MAX_LISTEN_POOL: usize = 4;
 
 impl Forward {
     pub fn target_port(&self) -> u16 {
         self.target.unwrap_or(self.port)
+    }
+
+    pub fn listen_pool(&self) -> usize {
+        self.listen_pool.unwrap_or(self.max_conns).min(self.max_conns).min(MAX_LISTEN_POOL)
     }
 }
 
@@ -101,7 +113,9 @@ idle_timeout_secs      = 300
 data_idle_timeout_secs = 60
 max_data_conns         = 2
 
-# Each [[forward]] maps a tailnet port to 127.0.0.1:<target>.
+# Each [[forward]] maps a tailnet port to 127.0.0.1:<target>. listen_pool
+# (optional, 1-4, at most max_conns, default max_conns) is how many
+# connections can arrive at once; each costs 32 KiB.
 [[forward]]
 port      = 1337
 kind      = "ftp"
@@ -167,6 +181,14 @@ impl ListenerConfig {
             }
             if f.max_conns == 0 {
                 return Err(LoadError::Invalid(format!("forward {i}: max_conns must be >= 1")));
+            }
+            if let Some(p) = f.listen_pool {
+                if p == 0 || p > f.max_conns || p > MAX_LISTEN_POOL {
+                    return Err(LoadError::Invalid(format!(
+                        "forward {i}: listen_pool must be 1..={}",
+                        f.max_conns.min(MAX_LISTEN_POOL)
+                    )));
+                }
             }
             if self.forwards[..i].iter().any(|g| g.port == f.port) {
                 return Err(LoadError::Invalid(format!("forward {i}: duplicate port {}", f.port)));
@@ -240,8 +262,8 @@ fn default_max_data_conns() -> usize {
 }
 fn default_forwards() -> Vec<Forward> {
     vec![
-        Forward { port: 1337, target: None, kind: ForwardKind::Ftp, max_conns: 2 },
-        Forward { port: 1338, target: None, kind: ForwardKind::Tcp, max_conns: 4 },
+        Forward { port: 1337, target: None, kind: ForwardKind::Ftp, max_conns: 2, listen_pool: None },
+        Forward { port: 1338, target: None, kind: ForwardKind::Tcp, max_conns: 4, listen_pool: None },
     ]
 }
 
@@ -258,6 +280,8 @@ mod tests {
         assert_eq!(c.forwards[0].max_conns, 2);
         assert_eq!(c.forwards[1].target_port(), 1338);
         assert_eq!(c.forwards[1].max_conns, 4);
+        assert_eq!(c.forwards[0].listen_pool(), 2);
+        assert_eq!(c.forwards[1].listen_pool(), 4);
         assert_eq!(c.state_dir, "ux0:/data/tailscale-vita");
         assert!(c.keep_awake);
         assert!(!c.keep_tailscale_services);
@@ -295,5 +319,18 @@ mod tests {
         assert_eq!(rc.auth_key, "secret");
         assert!(!rc.ftp.enabled);
         assert!(rc.tailnet.want_running);
+    }
+
+    #[test]
+    fn listen_pool_is_capped_and_checked() {
+        let one = |extra: &str| {
+            ListenerConfig::parse(&format!("[[forward]]\nport = 1338\nmax_conns = 8\n{extra}"))
+        };
+        assert_eq!(one("").unwrap().forwards[0].listen_pool(), MAX_LISTEN_POOL);
+        assert_eq!(one("listen_pool = 3").unwrap().forwards[0].listen_pool(), 3);
+        assert!(one("listen_pool = 0").is_err());
+        assert!(one("listen_pool = 5").is_err());
+        let small = ListenerConfig::parse("[[forward]]\nport = 9\nmax_conns = 1\nlisten_pool = 2");
+        assert!(small.is_err());
     }
 }
