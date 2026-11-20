@@ -36,6 +36,20 @@ const ACCEPT_STACK: usize = 64 * 1024;
 const ACCEPT_SLICE: Duration = Duration::from_millis(100);
 const SESSION_DRAIN: Duration = Duration::from_secs(5);
 const STATUS_EVERY: Duration = Duration::from_secs(60);
+/// Loopback port held for the life of the process, so the app and the
+/// background service never run two runtimes with one node key.
+const INSTANCE_LOCK_PORT: u16 = 41338;
+
+/// The background service's whole newlib heap. crt0 takes it before `main`,
+/// and it must fit in the service SELF's budget (daemon/build.sh, MEMSIZE)
+/// next to the image and the thread stacks. Measured use peaks near 1.2 MiB.
+/// The app build keeps newlib's default.
+#[cfg(all(target_os = "vita", feature = "daemon"))]
+#[no_mangle]
+#[used]
+pub static _newlib_heap_size_user: u32 = 6 * 1024 * 1024;
+
+const MODE: &str = if cfg!(feature = "daemon") { "daemon" } else { "app" };
 
 fn main() {
     let _ = vita_fs::create_dir_all(std::path::Path::new(config::CONFIG_DIR));
@@ -59,7 +73,7 @@ fn main() {
             return;
         }
     }
-    info!(build = env!("BUILD_TIMESTAMP"), version = env!("CARGO_PKG_VERSION"), "listener.startup");
+    info!(build = env!("BUILD_TIMESTAMP"), version = env!("CARGO_PKG_VERSION"), mode = MODE, "listener.startup");
     run(loaded);
     vita_log::flush();
     thread::sleep(Duration::from_secs(1));
@@ -76,6 +90,13 @@ fn run(loaded: Result<(ListenerConfig, bool), config::LoadError>) {
     if created {
         info!(path = config::CONFIG_PATH, "listener.config.template_written");
     }
+    let _instance_lock = match std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, INSTANCE_LOCK_PORT)) {
+        Ok(l) => l,
+        Err(e) => {
+            error!(error = %e, port = INSTANCE_LOCK_PORT, "listener.already_running; close the other listener first");
+            return;
+        }
+    };
     let rc = match lcfg.runtime_config() {
         Ok(rc) => rc,
         Err(e) => {
