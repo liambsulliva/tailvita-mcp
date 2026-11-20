@@ -123,12 +123,25 @@ fn run(loaded: Result<(ListenerConfig, bool), config::LoadError>) {
             .name("ts-runtime".into())
             .stack_size(RUNTIME_STACK)
             .spawn(move || {
-                // The app runs until the user closes it; the OS ends the
-                // process then, so the supervisor never needs to stop.
-                let r = run_supervised(rc, || false, |rt| Session::start(rt, &lcfg));
-                match r {
-                    Ok(s) => info!(?s, "listener.runtime.exit"),
-                    Err(e) => error!(error = %e, "listener.runtime.exit.error"),
+                // The listener runs until the user closes it; the OS ends
+                // the process then, so the supervisor never needs to stop.
+                // A failed bring-up (no route yet, control unreachable) used
+                // to end the process; try again instead, more slowly each time.
+                let mut failures = 0u32;
+                loop {
+                    match run_supervised(rc.clone(), || false, |rt| Session::start(rt, &lcfg)) {
+                        Ok(s) => {
+                            info!(?s, "listener.runtime.exit");
+                            break;
+                        }
+                        Err(e) => {
+                            failures += 1;
+                            let wait = retry_delay(failures);
+                            error!(error = %e, failures, retry_secs = wait.as_secs(), "listener.runtime.up_failed");
+                            vita_log::flush();
+                            thread::sleep(wait);
+                        }
+                    }
                 }
             })
     };
@@ -169,6 +182,11 @@ fn run(loaded: Result<(ListenerConfig, bool), config::LoadError>) {
     }
     let _ = runtime.join();
     info!("listener.done");
+}
+
+/// Wait before bring-up attempt `failures + 1`: 5 s, doubling to 60 s.
+fn retry_delay(failures: u32) -> Duration {
+    Duration::from_secs((5u64 << failures.saturating_sub(1).min(4)).min(60))
 }
 
 struct PortListener {
@@ -295,4 +313,16 @@ fn accept_loop(sh: Arc<Shared>, listeners: Vec<PortListener>) {
         }
     }
     info!(accepted, "listener.accept.done");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retry_delay_doubles_from_five_seconds_and_stops_at_a_minute() {
+        let secs: Vec<u64> = (1..=6).map(|n| retry_delay(n).as_secs()).collect();
+        assert_eq!(secs, [5, 10, 20, 40, 60, 60]);
+        assert_eq!(retry_delay(u32::MAX).as_secs(), 60);
+    }
 }
