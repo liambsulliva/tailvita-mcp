@@ -15,11 +15,13 @@ vita-fs        = { git = "https://github.com/koalabuttz/tailscale-vita", rev = "
 
 serde = { version = "1", features = ["derive"] }
 toml  = { version = "0.8", default-features = false, features = ["parse"] }
+# Screenshot port of the background service (src/capture.rs).
+jpeg-encoder = { version = "0.6", default-features = false, features = ["std"], optional = true }
 
 [features]
 # Background-service build (daemon/): a fixed newlib heap that fits inside the
 # service SELF's memory budget. See daemon/build.sh.
-daemon = []
+daemon = ["dep:jpeg-encoder"]
 
 [package.metadata.vita]
 title_id   = "TVIT00011"

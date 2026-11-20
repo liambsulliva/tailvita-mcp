@@ -17,6 +17,8 @@ use tailscale_vita::{run_supervised, Runtime};
 use vita_log::{error, info, warn, LogConfig, LogError};
 
 mod bridge;
+#[cfg(feature = "daemon")]
+mod capture;
 mod config;
 mod ftp;
 mod sys;
@@ -122,6 +124,8 @@ fn run(loaded: Result<(ListenerConfig, bool), config::LoadError>) {
         info!(port = f.port, target = f.target_port(), kind = ?f.kind, max_conns = f.max_conns, "listener.forward");
     }
 
+    #[cfg(feature = "daemon")]
+    let lcfg = with_capture(lcfg);
     let lcfg = Arc::new(lcfg);
     let runtime = {
         let lcfg = Arc::clone(&lcfg);
@@ -196,6 +200,23 @@ fn run(loaded: Result<(ListenerConfig, bool), config::LoadError>) {
     }
     let _ = runtime.join();
     info!("listener.done");
+}
+
+/// Start the screenshot port and, if it is up, forward the same tailnet
+/// port to it (it listens on the LAN and loopback by itself).
+#[cfg(feature = "daemon")]
+fn with_capture(mut lcfg: ListenerConfig) -> ListenerConfig {
+    let port = lcfg.capture_port;
+    if port != 0 && capture::start(port) && !lcfg.forwards.iter().any(|f| f.port == port) {
+        lcfg.forwards.push(config::Forward {
+            port,
+            target: None,
+            kind: ForwardKind::Tcp,
+            max_conns: 1,
+            listen_pool: None,
+        });
+    }
+    lcfg
 }
 
 /// Wait before bring-up attempt `failures + 1`: 5 s, doubling to 60 s.

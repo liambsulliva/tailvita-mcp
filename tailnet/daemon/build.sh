@@ -1,8 +1,8 @@
 #!/bin/bash
 # Build the Tailnet Daemon package: one bubble, two programs.
 #
-#   eboot.bin   launcher (launcher.c): loads the SceShell module, starts the
-#               service, exits.
+#   eboot.bin   launcher (launcher.c): loads the SceShell module and the
+#               kernel capture helper, starts the service, exits.
 #   eboot2.bin  the service: tailnet-listener built with `--features daemon`,
 #               in a SELF that carries a memory budget.
 #
@@ -36,9 +36,13 @@ CONTENT_TAIL="TAILNETDAEMON000"
 MEMSIZE_KB=12288
 ATTRIBUTE=3
 
+echo "==> launcher, SceShell module, kernel capture helper"
+cmake -S "$HERE" -B "$OUT/cmake" >/dev/null
+cmake --build "$OUT/cmake" -j2 >/dev/null
+
 echo "==> service: cargo vita build (features: daemon)"
 # Its own target dir, so the app build's artifacts are not overwritten.
-(cd "$TAILNET" && cargo vita build velf -p tailnet-listener --release \
+(cd "$TAILNET" && TAILNET_DAEMON_STUBS="$OUT/cmake" cargo vita build velf -p tailnet-listener --release \
     --features daemon --target-dir "$TAILNET/target/daemon")
 VELF="$TAILNET/target/daemon/armv7-sony-vita-newlibeabihf/release/tailnet-listener.velf"
 vita-make-fself -c -m "$MEMSIZE_KB" -at "$ATTRIBUTE" "$VELF" "$OUT/eboot2.bin"
@@ -54,10 +58,6 @@ if at < 0:
 print(f"    ATTRIBUTE={attr} MEMSIZE={memsize} KiB at {at:#x}")
 PY
 
-echo "==> launcher + SceShell hook"
-cmake -S "$HERE" -B "$OUT/cmake" >/dev/null
-cmake --build "$OUT/cmake" -j2 >/dev/null
-
 echo "==> param.sfo / param2.sfo"
 python3 "$HERE/sfo_make.py" --ref "$HERE/reference" --out "$OUT" \
   --gdc-id "$LAUNCHER_ID" --gdc-title "$LAUNCHER_TITLE" \
@@ -72,6 +72,7 @@ vita-pack-vpk \
   -a "$OUT/eboot2.bin=eboot2.bin" \
   -a "$OUT/param2.sfo=sce_sys/param2.sfo" \
   -a "$OUT/cmake/tailnet_shell.suprx=tailnet_shell.suprx" \
+  -a "$OUT/cmake/tailnet_capture.skprx=tailnet_capture.skprx" \
   -a "$HERE/assets/icon0.png=sce_sys/icon0.png" \
   -a "$HERE/assets/bg0.png=sce_sys/livearea/contents/bg0.png" \
   -a "$HERE/assets/startup.png=sce_sys/livearea/contents/startup.png" \

@@ -27,6 +27,17 @@ fn main() {
         println!("cargo::rustc-link-arg=-lSceProcessmgr_stub");
         println!("cargo::rustc-link-arg=-lSceSysmem_stub");
 
+        // The background service calls the kernel capture helper
+        // (daemon/capture_kernel.c). Its stub library is built by
+        // daemon/build.sh before cargo runs.
+        println!("cargo::rerun-if-env-changed=TAILNET_DAEMON_STUBS");
+        if std::env::var_os("CARGO_FEATURE_DAEMON").is_some() {
+            let stubs = std::env::var("TAILNET_DAEMON_STUBS")
+                .expect("the daemon feature needs TAILNET_DAEMON_STUBS (set by daemon/build.sh)");
+            println!("cargo::rustc-link-search=native={stubs}");
+            println!("cargo::rustc-link-arg=-ltailnet_capture_stub");
+        }
+
         // vita-elf-create appends ~2 KiB of SCE module data after the text
         // segment. The data segment starts at the next 64 KiB boundary, so
         // that gap depends on the text size and can be too small

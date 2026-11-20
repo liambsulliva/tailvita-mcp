@@ -89,6 +89,11 @@ pub struct ListenerConfig {
     /// Concurrent FTP passive data connections, across all FTP sessions.
     #[serde(default = "default_max_data_conns")]
     pub max_data_conns: usize,
+    /// Screenshot port of the background service (0 turns it off). The app
+    /// build ignores it.
+    #[serde(default = "default_capture_port")]
+    #[cfg_attr(not(feature = "daemon"), allow(dead_code))]
+    pub capture_port: u16,
     #[serde(default = "default_forwards", rename = "forward")]
     pub forwards: Vec<Forward>,
 }
@@ -112,6 +117,10 @@ keep_awake = true
 idle_timeout_secs      = 300
 data_idle_timeout_secs = 60
 max_data_conns         = 2
+
+# Background service only: screenshots as JPEG on this port, on the LAN and
+# the tailnet. 0 turns it off.
+capture_port = 1339
 
 # Each [[forward]] maps a tailnet port to 127.0.0.1:<target>. listen_pool
 # (optional, 1-4, at most max_conns, default max_conns) is how many
@@ -260,6 +269,10 @@ fn default_data_idle_timeout() -> u64 {
 fn default_max_data_conns() -> usize {
     2
 }
+fn default_capture_port() -> u16 {
+    1339
+}
+
 fn default_forwards() -> Vec<Forward> {
     vec![
         Forward { port: 1337, target: None, kind: ForwardKind::Ftp, max_conns: 2, listen_pool: None },
