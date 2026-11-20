@@ -26,48 +26,15 @@
 #include <psp2/rtc.h>
 #include <psp2/types.h>
 
-#define DIR_PATH  "ux0:data/tailnet-probe"
+#include "common.h"
+
 #define LOG_PATH  DIR_PATH "/shellmem.log"
-#define STOP_PATH DIR_PATH "/stop"
 
 #define SAMPLE_SEC   5
 #define LADDER_EVERY 2
 #define MAX_MINUTES  90
 
-/* Block sizes tried, largest first, in KiB. CDRAM blocks must be multiples
- * of 256 KiB and physically contiguous ones multiples of 1 MiB, so those
- * types stop at their own smallest step. */
-static const unsigned LADDER_KB[] = {
-    32768, 24576, 16384, 12288, 8192, 6144, 4096, 3072, 2048, 1024, 512, 256, 64,
-};
-#define N_LADDER (sizeof LADDER_KB / sizeof LADDER_KB[0])
-
-static void log_line(const char *msg)
-{
-    SceUID fd = sceIoOpen(LOG_PATH, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0666);
-    if (fd < 0)
-        return;
-    sceIoWrite(fd, msg, sceClibStrnlen(msg, 400));
-    sceIoWrite(fd, "\n", 1);
-    sceIoClose(fd);
-}
-
-/* Largest block of `type` that can be allocated right now, in KiB, trying no
- * size below `min_kb`. The block is freed straight away. `*err` gets the
- * error of the last size that failed (0 if the first try worked). */
-static unsigned max_alloc_kb(SceKernelMemBlockType type, unsigned min_kb, int *err)
-{
-    *err = 0;
-    for (unsigned i = 0; i < N_LADDER && LADDER_KB[i] >= min_kb; i++) {
-        SceUID blk = sceKernelAllocMemBlock("tnprobe", type, LADDER_KB[i] << 10, NULL);
-        if (blk >= 0) {
-            sceKernelFreeMemBlock(blk);
-            return LADDER_KB[i];
-        }
-        *err = blk;
-    }
-    return 0;
-}
+#define log_line(msg) log_to(LOG_PATH, msg)
 
 /* Title IDs of the running apps, comma separated. */
 static void running_apps(char *out, unsigned cap)
@@ -112,8 +79,7 @@ static int probe_main(SceSize args, void *argp)
     log_line(line);
 
     for (unsigned n = 0;; n++) {
-        SceIoStat st;
-        if (sceIoGetstat(STOP_PATH, &st) >= 0) {
+        if (stop_requested()) {
             log_line("--- shellprobe stop (stop file)");
             break;
         }
@@ -142,9 +108,9 @@ static int probe_main(SceSize args, void *argp)
                                 mi.size_phycont / 1024);
         if (n % LADDER_EVERY == 0 && w > 0 && (unsigned)w < sizeof line) {
             int eu, ec, ep;
-            unsigned ku = max_alloc_kb(SCE_KERNEL_MEMBLOCK_TYPE_USER_RW, 64, &eu);
-            unsigned kc = max_alloc_kb(SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW, 256, &ec);
-            unsigned kp = max_alloc_kb(SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_RW, 1024, &ep);
+            unsigned ku = max_alloc_kb(SCE_KERNEL_MEMBLOCK_TYPE_USER_RW, 64, 32768, &eu);
+            unsigned kc = max_alloc_kb(SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW, 256, 32768, &ec);
+            unsigned kp = max_alloc_kb(SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_RW, 1024, 32768, &ep);
             w += sceClibSnprintf(line + w, sizeof line - w,
                                  " max_kb user=%u cdram=%u phycont=%u err=%X/%X/%X",
                                  ku, kc, kp, (unsigned)eu, (unsigned)ec, (unsigned)ep);
