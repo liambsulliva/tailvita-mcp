@@ -16,12 +16,13 @@ GLYPH=(-stroke "$LINE" -strokewidth 5 -fill none
 
 convert -size 128x128 "xc:$BG" "${GLYPH[@]}" -colors 64 PNG8:icon0.png
 
+# The start button's frame (startup.png) sits over the middle of this image,
+# so the middle is left empty and the words go underneath.
 convert -size 840x500 "xc:$BG" \
-  \( -size 128x128 xc:none "${GLYPH[@]}" -resize 220x220 \) -geometry +80+140 -composite \
-  -font "$FONT" -fill "$TEXT" -pointsize 46 -annotate +350+235 "Tailnet Daemon" \
-  -font DejaVu-Sans -fill "$DIM" -pointsize 24 \
-  -annotate +352+285 "Open to start the background service." \
-  -annotate +352+320 "Hold L while opening to stop it." \
+  -font "$FONT" -fill "$TEXT" -pointsize 30 -gravity south -annotate +0+92 "Tailnet Daemon" \
+  -font DejaVu-Sans -fill "$DIM" -pointsize 20 \
+  -annotate +0+56 "Open to start the background service." \
+  -annotate +0+28 "Hold L while opening to stop it." \
   -colors 64 PNG8:bg0.png
 
 convert -size 280x158 "xc:$BG" \
