@@ -15,10 +15,7 @@ include("${VITASDK}/share/vita.cmake" REQUIRED)
 # budget, so it can open beside a running game.
 add_executable(launcher launcher.c)
 target_compile_options(launcher PRIVATE -Wall -O2 -std=gnu11)
-add_dependencies(launcher tailnet_capture_stubs)
-target_link_directories(launcher PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 target_link_libraries(launcher
-  tailnet_capture_stub
   SceRtc_stub
   taihen_stub
   SceBgAppUtil_stub
@@ -45,7 +42,7 @@ vita_create_self(tailnet_shell.suprx tailnet_shell
   UNSAFE)
 
 # The kernel helper that reads the frame on screen (capture_kernel.c), and the
-# stub library its callers link (the launcher's self-test and the service).
+# stub library the service links.
 add_executable(tailnet_capture capture_kernel.c)
 target_compile_definitions(tailnet_capture PRIVATE __VITA_KERNEL__)
 target_compile_options(tailnet_capture PRIVATE -Wall -O2 -fno-pic -fno-PIC -std=gnu99)

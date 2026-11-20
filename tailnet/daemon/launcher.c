@@ -31,8 +31,6 @@
 #include <stdarg.h>
 #include <taihen.h>
 
-#include "capture.h"
-
 #define DIR_PATH "ux0:data/tailnet-listener"
 #define LOG_PATH DIR_PATH "/launcher.log"
 #define MOD_SRC  "app0:tailnet_shell.suprx"
@@ -130,7 +128,7 @@ static unsigned long long boot_seconds(void)
 }
 
 /* True if CAP_READY was written during this boot: the same SceShell pid and
- * a boot time within a few seconds. A kernel module must not be loaded
+ * a boot time within two minutes. A kernel module must not be loaded
  * twice, and nothing else says whether ours is already there. */
 static int capture_ready_this_boot(SceUID shell)
 {
@@ -153,7 +151,7 @@ static int capture_ready_this_boot(SceUID shell)
         pid = pid * 10 + (unsigned)(*p++ - '0');
     unsigned long long now = boot_seconds();
     unsigned long long apart = now > boot ? now - boot : boot - now;
-    return pid == (unsigned)shell && apart <= 5;
+    return pid == (unsigned)shell && apart <= 120;
 }
 
 static void load_capture_module(SceUID shell)
@@ -179,20 +177,11 @@ static void load_capture_module(SceUID shell)
     if (mod < 0)
         return;
 
-    /* Self-test before anyone relies on it: one snapshot of this screen. */
-    int ver = tnCaptureGetApiVersion();
-    tn_capture_info info = { 0 };
-    int rc = ver == TN_CAPTURE_API_VERSION ? tnCaptureSnapshot(&info) : -100;
-    static unsigned char row[TN_CAPTURE_MAX_PITCH * 4];
-    int got = rc == 0 ? tnCaptureRead(info.height / 2, 1, row, sizeof row) : -100;
-    tnCaptureRelease();
-    say("launcher: capture self-test version=%d snapshot=%d %ux%u pitch=%u owner=%08X row=%d "
-        "pixel=%02X%02X%02X",
-        ver, rc, (unsigned)info.width, (unsigned)info.height, (unsigned)info.pitch,
-        (unsigned)info.pid, got, row[0], row[1], row[2]);
-    if (ver != TN_CAPTURE_API_VERSION)
-        return;
-
+    /* Record it at once: a second load of a kernel module must not happen.
+     * This process cannot call the helper itself, because its imports were
+     * bound when it started, before the helper existed; the service starts
+     * afterwards and checks the helper's version before offering
+     * screenshots. */
     /* "<boot seconds> <pid>\n"; the boot time is written digit by digit
      * because it does not fit the 32-bit formats. */
     char digits[24];
