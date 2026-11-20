@@ -52,6 +52,8 @@ counts and free user, CDRAM and phycont memory.
   the whole wait, so a lock shared by two copy threads would stall writes.
 - netstack has no half-close, so EOF or an error on either side closes both.
   So do the idle timeout (300 s, or 60 s for FTP data) and a runtime relogin.
+  An FTP control connection doesn't idle out while one of its data
+  transfers is running, so slow multi-minute downloads keep their final reply.
 - FTP: the companion picks an ephemeral passive port for each transfer, so a
   plain port forward can't carry the data connection. The 1337 forwarder
   reads the control channel line by line. For each `227`/`229` reply it binds
@@ -63,5 +65,7 @@ counts and free user, CDRAM and phycont memory.
 
 - Thread stacks: 256 KiB for the runtime, 64 KiB for accept, 64 KiB for each connection pump, 32 KiB for each loopback reader.
 - netstack fixes each tailnet socket at 16 KiB rx + 16 KiB tx (`netstack::buf`, not configurable at this rev).
-- Listening pools are capped at 2 sockets per port, so idle listeners hold 4 × 32 KiB.
+- Each port keeps `listen_pool` sockets listening (default `max_conns`, at most 4): that many
+  connections can arrive at the same moment. The defaults hold 2 on 1337 and 4 on 1338,
+  6 × 32 KiB in all.
 - The newlib heap size is left at the default, the same as the demo.
