@@ -61,6 +61,11 @@ To recover from a bootloop: boot without plugins, open VitaShell, and copy the b
 - **Listener burst connections.** Each port accepts at most 2 new connections at once, so a burst of parallel connections to 1338 sees refusals. Raising 1338 to 4 costs about 64 KiB.
 - **Tailnet throughput.** About 25 KB/s against 500 KB/s on the LAN; the limit looks like the Vita's userspace network stack, not the forwarding code.
 - **Import `ps-vita-mcp/`** from the Mac.
+- **Tailnet while another app is open (parked).** The listener only works in the foreground, so over the tailnet there are no screenshots, input or log pulls while a game runs. On the home LAN this doesn't matter. A phase 0 study (2026-11-20) found no cheap fix, and the decision is to stay on the existing listener until this actually blocks work:
+  - *Listener as a SceShell plugin:* upstream tailscale-vita tried this at `88a992c` (`crates/tailscale-vita-plugin`, `docs/PLUGIN-DEPLOY.md`) and closed it after six attempts. Loading the runtime into SceShell at boot froze 4 of 5 boots; loading it after boot ran out of memory (`0x80024302`). Our listener image is about 3.0 MB in memory, larger than upstream's 2.3 MB.
+  - *Background app (upstream's M21):* survives the home screen and normal games, but is killed when an enlarged-memory game launches. Ghost Trick sets `ATTRIBUTE2=12`.
+  - *Subnet route from a machine on the Vita's network:* needs no Vita change, but needs a second machine there and a route approval.
+  - Missing data if this is reopened: the listener's real heap peak (it uses newlib's default 128 MiB block and logs only system free memory) and SceShell's free memory with a game running.
 
 ## Conventions
 
