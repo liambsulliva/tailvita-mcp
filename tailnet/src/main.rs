@@ -120,16 +120,24 @@ fn run(loaded: Result<(ListenerConfig, bool), config::LoadError>) {
     };
 
     let mut last_status = Instant::now() - STATUS_EVERY;
+    // Sampled every second so short spikes between status lines still count.
+    let mut heap_peak = sys::HeapPeak::default();
     while !runtime.is_finished() {
         if lcfg.keep_awake {
             sys::power_tick();
         }
+        let heap = sys::heap_use();
+        heap_peak.sample(heap);
         if last_status.elapsed() >= STATUS_EVERY {
             last_status = Instant::now();
             let m = sys::free_memory();
             info!(
                 conns = bridge::ACTIVE_CONNS.load(Ordering::Acquire),
                 data_conns = bridge::ACTIVE_DATA.load(Ordering::Acquire),
+                heap_used_kb = heap.used_kb,
+                heap_arena_kb = heap.arena_kb,
+                heap_peak_used_kb = heap_peak.used_kb,
+                heap_peak_arena_kb = heap_peak.arena_kb,
                 free_user_kb = m.user_kb,
                 free_cdram_kb = m.cdram_kb,
                 free_phycont_kb = m.phycont_kb,
