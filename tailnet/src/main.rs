@@ -82,6 +82,8 @@ fn main() {
         }
     }
     info!(build = env!("BUILD_TIMESTAMP"), version = env!("CARGO_PKG_VERSION"), mode = MODE, "listener.startup");
+    // On the card at once: a service that dies early should still leave a trace.
+    vita_log::flush();
     run(loaded);
     vita_log::flush();
     thread::sleep(Duration::from_secs(1));

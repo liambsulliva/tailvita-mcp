@@ -11,9 +11,9 @@
  *    system may end one again when memory runs short. While KEEP_PATH exists,
  *    one small thread checks every POLL_SEC seconds whether the service is
  *    running and starts it again after it has been gone for GONE_POLLS
- *    checks. It gives up after MAX_FAILS failed starts in a row, or after
- *    MAX_BLIND starts with the service never once seen running (in case the
- *    check itself does not work on this firmware).
+ *    checks. It gives up after MAX_FAILS refused starts in a row, or after
+ *    MAX_BLIND starts that did not bring the service up, until the service
+ *    is seen running again (opening the bubble starts it).
  *
  * The launcher loads this module into SceShell at run time, so nothing is
  * listed in ur0:tai/config.txt and it is gone after a reboot. A second copy
@@ -92,7 +92,6 @@ static int watchdog_main(SceSize args, void *argp)
     (void)argp;
     char line[160];
     int last = -1;          /* last logged state: 1 running, 0 gone */
-    int ever_seen = 0;
     unsigned gone = 0, fails = 0, blind = 0;
     int gave_up = 0;
 
@@ -115,7 +114,6 @@ static int watchdog_main(SceSize args, void *argp)
             last = running;
         }
         if (running) {
-            ever_seen = 1;
             gone = fails = blind = 0;
             gave_up = 0;
             continue;
@@ -123,7 +121,10 @@ static int watchdog_main(SceSize args, void *argp)
         if (gave_up || ++gone < GONE_POLLS)
             continue;
         gone = 0;
-        if (fails >= MAX_FAILS || (!ever_seen && blind >= MAX_BLIND)) {
+        /* `blind` counts starts since the service was last seen running. A
+         * start can report success and the service still never appear (seen
+         * on 2026-11-20), so the count applies whether or not it ever ran. */
+        if (fails >= MAX_FAILS || blind >= MAX_BLIND) {
             say("shell: giving up on restarts until the service is seen running again");
             gave_up = 1;
             continue;

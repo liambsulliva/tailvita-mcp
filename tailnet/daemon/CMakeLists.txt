@@ -43,18 +43,24 @@ vita_create_self(tailnet_shell.suprx tailnet_shell
 
 # The kernel helper that reads the frame on screen (capture_kernel.c), and the
 # stub library the service links.
-add_executable(tailnet_capture capture_kernel.c)
-target_compile_definitions(tailnet_capture PRIVATE __VITA_KERNEL__)
-target_compile_options(tailnet_capture PRIVATE -Wall -O2 -fno-pic -fno-PIC -std=gnu99)
-target_link_options(tailnet_capture PRIVATE -Wl,-q -nostdlib)
-target_link_libraries(tailnet_capture
+# The 2 in the module and library names is the interface generation. A kernel
+# module cannot be replaced without a reboot, so an incompatible interface
+# gets new names and can be loaded beside an old copy that is still resident.
+# (The yml cannot carry this note: vita.cmake does not accept comments there.)
+add_executable(tailnet_capture2 capture_kernel.c)
+target_compile_definitions(tailnet_capture2 PRIVATE __VITA_KERNEL__)
+# -mgeneral-regs-only: no NEON or VFP registers in kernel code; the compiler
+# otherwise uses them for plain struct copies.
+target_compile_options(tailnet_capture2 PRIVATE -Wall -O2 -fno-pic -fno-PIC -std=gnu99 -mgeneral-regs-only)
+target_link_options(tailnet_capture2 PRIVATE -Wl,-q -nostdlib)
+target_link_libraries(tailnet_capture2
   SceDisplayForDriver_stub
   SceSysmemForDriver_stub
   SceThreadmgrForDriver_stub
   SceCpuForDriver_stub
   gcc)
-vita_create_self(tailnet_capture.skprx tailnet_capture
+vita_create_self(tailnet_capture.skprx tailnet_capture2
   CONFIG ${CMAKE_CURRENT_SOURCE_DIR}/tailnet_capture.yml
   UNSAFE)
-vita_create_stubs(tailnet_capture_stubs tailnet_capture
+vita_create_stubs(tailnet_capture_stubs tailnet_capture2
   ${CMAKE_CURRENT_SOURCE_DIR}/tailnet_capture.yml KERNEL)

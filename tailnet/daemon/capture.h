@@ -4,35 +4,37 @@
 
 #include <stdint.h>
 
-#define TN_CAPTURE_API_VERSION 1
+#define TN_CAPTURE_API_VERSION 2
 #define TN_CAPTURE_MAX_PITCH   1024
 #define TN_CAPTURE_MAX_HEIGHT  544
+
+/* Errors. They are shaped like SCE error codes on purpose: a syscall's
+ * small negative return value (-7, say) reaches the caller with bit 30
+ * cleared (0xBFFFFFF9), so plain negative numbers cannot be told apart
+ * reliably. */
+#define TN_CAPTURE_ERR_ARGUMENT  ((int)0x80F70001) /* null pointer */
+#define TN_CAPTURE_ERR_NO_FRAME  ((int)0x80F70002) /* nothing on screen */
+#define TN_CAPTURE_ERR_FORMAT    ((int)0x80F70003) /* unsupported format or size */
+#define TN_CAPTURE_ERR_TOO_SMALL ((int)0x80F70004) /* dst smaller than the frame */
+/* Any other negative value is the SCE error of the memory copy that failed. */
 
 typedef struct tn_capture_info {
     uint32_t width;
     uint32_t height;
-    uint32_t pitch;       /* pixels per stored row, >= width */
-    uint32_t pixelformat; /* always SCE_DISPLAY_PIXELFORMAT_A8B8G8R8 */
+    uint32_t pitch;       /* pixels per row as stored by the owner, >= width */
+    uint32_t pixelformat; /* SCE_DISPLAY_PIXELFORMAT_A8B8G8R8 when supported */
     uint32_t pid;         /* process that owns the frame */
 } tn_capture_info;
 
 /* TN_CAPTURE_API_VERSION of the loaded module. */
 int tnCaptureGetApiVersion(void);
 
-/* Copy the frame now on screen into the module's buffer and describe it.
- * 0 on success; < 0: -1 bad argument, -2 nothing on screen, -3 unsupported
- * format or size, -4 copy to caller failed, -7 no memory, -8 the frame's
- * memory could not be read. A snapshot stays until the next one or a
- * release. */
-int tnCaptureSnapshot(tn_capture_info *info);
-
-/* Copy `rows` rows of the snapshot, starting at `first_row`, to `dst`: each
- * row is `width` pixels of R, G, B, A bytes. Returns the bytes copied, or
- * < 0: -1 bad argument, -5 row out of range, -6 dst too small, -9 no
- * snapshot, -4 copy to caller failed. */
-int tnCaptureRead(uint32_t first_row, uint32_t rows, void *dst, uint32_t dst_size);
-
-/* Free the snapshot. */
-int tnCaptureRelease(void);
+/* Describe the frame now on screen and copy it to `dst` as `height` rows of
+ * `width` pixels, each R, G, B, A (so width * height * 4 bytes, without the
+ * owner's row padding). `info` is filled in whenever a frame was found, also
+ * when the call then fails with TN_CAPTURE_ERR_FORMAT or
+ * TN_CAPTURE_ERR_TOO_SMALL, so a caller can size its buffer from it.
+ * Returns 0 on success. */
+int tnCaptureFrame(tn_capture_info *info, void *dst, uint32_t dst_size);
 
 #endif

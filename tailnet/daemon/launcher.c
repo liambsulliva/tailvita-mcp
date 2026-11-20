@@ -40,8 +40,9 @@
 #define CAP_SRC  "app0:tailnet_capture.skprx"
 #define CAP_DST  DIR_PATH "/tailnet_capture.skprx"
 /* Written once the kernel helper is loaded: "<boot time> <SceShell pid>".
+ * The 2 matches the helper's interface generation (tailnet_capture.yml).
  * The service offers screenshots only while it exists. */
-#define CAP_READY DIR_PATH "/capture-ready"
+#define CAP_READY DIR_PATH "/capture2-ready"
 /* Leave the kernel alone when this file exists. */
 #define NO_CAPTURE DIR_PATH "/no-capture"
 /* While this file exists the SceShell module restarts a service that died. */

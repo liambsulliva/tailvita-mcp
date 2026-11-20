@@ -35,7 +35,7 @@ fn main() {
             let stubs = std::env::var("TAILNET_DAEMON_STUBS")
                 .expect("the daemon feature needs TAILNET_DAEMON_STUBS (set by daemon/build.sh)");
             println!("cargo::rustc-link-search=native={stubs}");
-            println!("cargo::rustc-link-arg=-ltailnet_capture_stub");
+            println!("cargo::rustc-link-arg=-ltailnet_capture2_stub");
         }
 
         // vita-elf-create appends ~2 KiB of SCE module data after the text

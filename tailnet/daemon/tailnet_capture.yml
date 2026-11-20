@@ -1,16 +1,14 @@
-tailnet_capture:
+tailnet_capture2:
   attributes: 0
   version:
-    major: 1
+    major: 2
     minor: 0
   main:
     start: module_start
     stop: module_stop
   libraries:
-    TailnetCapture:
+    TailnetCapture2:
       syscall: true
       functions:
         - tnCaptureGetApiVersion
-        - tnCaptureSnapshot
-        - tnCaptureRead
-        - tnCaptureRelease
+        - tnCaptureFrame

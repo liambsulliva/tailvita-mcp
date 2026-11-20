@@ -30,10 +30,11 @@ CONTENT_TAIL="TAILNETDAEMON000"
 # 16 MiB budget: 3.0 MiB free at start, 2.0 MiB free once every thread was
 # up, so everything but the heap takes about 8.2 MiB (image, thread stacks,
 # network memory), plus 96 KiB per open connection. With the 2 MiB heap
-# (src/main.rs) that is about 11 MiB at full load; 12 MiB leaves 1 MiB spare.
-# A background service is the first thing the system ends when memory runs
-# short beside an enlarged-memory game, so smaller is safer.
-MEMSIZE_KB=12288
+# (src/main.rs) that is about 11 MiB at full load. A screenshot borrows one
+# more 2.0 MiB block for the frame (src/capture.rs). 15 MiB leaves about
+# 2 MiB spare. A background service is the first thing the system ends when
+# memory runs short beside an enlarged-memory game, so smaller is safer.
+MEMSIZE_KB=15360
 ATTRIBUTE=3
 
 echo "==> launcher, SceShell module, kernel capture helper"

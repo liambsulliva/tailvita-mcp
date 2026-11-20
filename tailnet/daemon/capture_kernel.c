@@ -3,13 +3,15 @@
  * A user process can only read its own framebuffer. To take a screenshot of
  * whatever is in front (a game, or the shell), this kernel module asks the
  * display driver which framebuffer is on the primary head and copies it out
- * of the owning process. The system screenshot is no use to the background
- * service: taken while an enlarged-memory game is loaded, it makes the
- * system end the service.
+ * of the owning process into the caller's buffer. The system screenshot is
+ * no use to the background service: taken while an enlarged-memory game is
+ * loaded, it makes the system end the service.
  *
- * tnCaptureSnapshot copies the whole frame into a kernel block in one go, so
- * the picture does not tear; tnCaptureRead then hands it out a few rows at a
- * time, so the caller never needs the 2 MiB frame in its own memory.
+ * The whole frame is copied inside one call, a row at a time through a 4 KiB
+ * buffer, so the module allocates nothing. (A first version kept a 2 MiB
+ * snapshot in kernel memory; the kernel refused that allocation.) The copy
+ * takes a few milliseconds, short enough that the picture does not tear in
+ * practice.
  *
  * The launcher loads this module at run time with taiHEN. It is never listed
  * in ur0:tai/config.txt, hooks nothing, and is gone after a reboot.
@@ -17,7 +19,6 @@
 #include <psp2kern/display.h>
 #include <psp2kern/kernel/cpu.h>
 #include <psp2kern/kernel/modulemgr.h>
-#include <psp2kern/kernel/sysmem.h>
 #include <psp2kern/kernel/sysmem/data_transfers.h>
 #include <psp2kern/kernel/threadmgr.h>
 #include <stdint.h>
@@ -25,10 +26,8 @@
 #include "capture.h"
 
 static SceUID g_mutex = -1;
-static SceUID g_block = -1;      /* the snapshot's memory block */
-static uint8_t *g_pixels;        /* its base */
-static uint32_t g_block_bytes;
-static tn_capture_info g_info;   /* describes the snapshot; width 0 = none */
+/* One row on its way from the owner to the caller. Guarded by g_mutex. */
+static uint8_t g_row[TN_CAPTURE_MAX_PITCH * 4];
 
 static int current_frame(SceDisplayFrameBufInfo *info)
 {
@@ -47,122 +46,63 @@ static int current_frame(SceDisplayFrameBufInfo *info)
     return -1;
 }
 
-static void drop_snapshot(void)
-{
-    if (g_block >= 0)
-        ksceKernelFreeMemBlock(g_block);
-    g_block = -1;
-    g_pixels = NULL;
-    g_block_bytes = 0;
-    g_info.width = 0;
-}
-
-static int snapshot_locked(tn_capture_info *out)
-{
-    SceDisplayFrameBufInfo fb;
-    if (current_frame(&fb) < 0)
-        return -2;
-    if (fb.framebuf.pixelformat != SCE_DISPLAY_PIXELFORMAT_A8B8G8R8 ||
-        fb.framebuf.pitch < fb.framebuf.width ||
-        fb.framebuf.pitch > TN_CAPTURE_MAX_PITCH ||
-        fb.framebuf.height > TN_CAPTURE_MAX_HEIGHT)
-        return -3;
-
-    uint32_t bytes = fb.framebuf.pitch * fb.framebuf.height * 4u;
-    uint32_t need = (bytes + 0xFFFu) & ~0xFFFu;
-    if (g_block < 0 || g_block_bytes < need) {
-        drop_snapshot();
-        SceUID blk = ksceKernelAllocMemBlock("tailnet_capture", SCE_KERNEL_MEMBLOCK_TYPE_KERNEL_RW,
-                                             need, NULL);
-        if (blk < 0)
-            return -7;
-        void *base = NULL;
-        if (ksceKernelGetMemBlockBase(blk, &base) < 0 || base == NULL) {
-            ksceKernelFreeMemBlock(blk);
-            return -7;
-        }
-        g_block = blk;
-        g_pixels = base;
-        g_block_bytes = need;
-    }
-    g_info.width = 0;
-    if (ksceKernelCopyFromUserProc(fb.pid, g_pixels, fb.framebuf.base, bytes) < 0)
-        return -8;
-
-    g_info.width = fb.framebuf.width;
-    g_info.height = fb.framebuf.height;
-    g_info.pitch = fb.framebuf.pitch;
-    g_info.pixelformat = fb.framebuf.pixelformat;
-    g_info.pid = (uint32_t)fb.pid;
-    *out = g_info;
-    return 0;
-}
-
 int tnCaptureGetApiVersion(void)
 {
     return TN_CAPTURE_API_VERSION;
 }
 
-int tnCaptureSnapshot(tn_capture_info *user_info)
+int tnCaptureFrame(tn_capture_info *user_info, void *user_dst, uint32_t dst_size)
 {
     uint32_t state;
-    tn_capture_info out;
-    int rc;
+    SceDisplayFrameBufInfo fb;
+    tn_capture_info info;
+    int rc = 0;
 
     ENTER_SYSCALL(state);
-    if (!user_info) {
-        rc = -1;
-    } else {
-        ksceKernelLockMutex(g_mutex, 1, NULL);
-        rc = snapshot_locked(&out);
-        ksceKernelUnlockMutex(g_mutex, 1);
-        if (rc == 0 && ksceKernelCopyToUser(user_info, &out, sizeof out) < 0)
-            rc = -4;
+    if (!user_info || !user_dst) {
+        EXIT_SYSCALL(state);
+        return TN_CAPTURE_ERR_ARGUMENT;
     }
-    EXIT_SYSCALL(state);
-    return rc;
-}
-
-int tnCaptureRead(uint32_t first_row, uint32_t rows, void *user_dst, uint32_t dst_size)
-{
-    uint32_t state;
-    int rc;
-
-    ENTER_SYSCALL(state);
     ksceKernelLockMutex(g_mutex, 1, NULL);
-    if (!user_dst || rows == 0) {
-        rc = -1;
-    } else if (g_info.width == 0 || !g_pixels) {
-        rc = -9;
-    } else if (first_row >= g_info.height || rows > g_info.height - first_row) {
-        rc = -5;
-    } else if (dst_size / (g_info.width * 4u) < rows) {
-        rc = -6;
-    } else {
-        uint32_t row_bytes = g_info.width * 4u;
-        rc = (int)(row_bytes * rows);
-        for (uint32_t r = 0; r < rows; r++) {
-            const uint8_t *src = g_pixels + (uintptr_t)(first_row + r) * g_info.pitch * 4u;
-            if (ksceKernelCopyToUser((uint8_t *)user_dst + (uintptr_t)r * row_bytes, src, row_bytes) < 0) {
-                rc = -4;
-                break;
-            }
-        }
+
+    if (current_frame(&fb) < 0) {
+        rc = TN_CAPTURE_ERR_NO_FRAME;
+        goto out;
     }
+    info.width = fb.framebuf.width;
+    info.height = fb.framebuf.height;
+    info.pitch = fb.framebuf.pitch;
+    info.pixelformat = fb.framebuf.pixelformat;
+    info.pid = (uint32_t)fb.pid;
+    rc = ksceKernelCopyToUser(user_info, &info, sizeof info);
+    if (rc < 0)
+        goto out;
+
+    if (info.pixelformat != SCE_DISPLAY_PIXELFORMAT_A8B8G8R8 || info.pitch < info.width ||
+        info.pitch > TN_CAPTURE_MAX_PITCH || info.height > TN_CAPTURE_MAX_HEIGHT) {
+        rc = TN_CAPTURE_ERR_FORMAT;
+        goto out;
+    }
+    uint32_t row_bytes = info.width * 4u;
+    if (dst_size / row_bytes < info.height) {
+        rc = TN_CAPTURE_ERR_TOO_SMALL;
+        goto out;
+    }
+    for (uint32_t y = 0; y < info.height; y++) {
+        const uint8_t *src = (const uint8_t *)fb.framebuf.base + (uintptr_t)y * info.pitch * 4u;
+        rc = ksceKernelCopyFromUserProc(fb.pid, g_row, src, row_bytes);
+        if (rc < 0)
+            goto out;
+        rc = ksceKernelCopyToUser((uint8_t *)user_dst + (uintptr_t)y * row_bytes, g_row, row_bytes);
+        if (rc < 0)
+            goto out;
+    }
+    rc = 0;
+
+out:
     ksceKernelUnlockMutex(g_mutex, 1);
     EXIT_SYSCALL(state);
     return rc;
-}
-
-int tnCaptureRelease(void)
-{
-    uint32_t state;
-    ENTER_SYSCALL(state);
-    ksceKernelLockMutex(g_mutex, 1, NULL);
-    drop_snapshot();
-    ksceKernelUnlockMutex(g_mutex, 1);
-    EXIT_SYSCALL(state);
-    return 0;
 }
 
 void _start() __attribute__((weak, alias("module_start")));
@@ -171,7 +111,7 @@ int module_start(SceSize argc, const void *args)
 {
     (void)argc;
     (void)args;
-    g_mutex = ksceKernelCreateMutex("tailnet_capture", 0, 0, NULL);
+    g_mutex = ksceKernelCreateMutex("tailnet_capture2", 0, 0, NULL);
     if (g_mutex < 0)
         return SCE_KERNEL_START_FAILED;
     return SCE_KERNEL_START_SUCCESS;
@@ -181,6 +121,5 @@ int module_stop(SceSize argc, const void *args)
 {
     (void)argc;
     (void)args;
-    drop_snapshot();
     return SCE_KERNEL_STOP_SUCCESS;
 }

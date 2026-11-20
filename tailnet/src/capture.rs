@@ -15,9 +15,9 @@
 //! system end background services.
 //!
 //! The frame comes from `tailnet_capture.skprx` (daemon/capture_kernel.c),
-//! which snapshots it in kernel memory and hands it out a few rows at a
-//! time. The encoder pulls those rows as it goes, so the 2 MiB frame never
-//! sits in this process.
+//! which copies it into a 2 MiB memory block this process holds only while
+//! a screenshot is being sent. The block is outside the newlib heap, so the
+//! heap stays small.
 
 // Off the Vita only `serve` is built (for the tests); the listener half is not.
 #![cfg_attr(not(target_os = "vita"), allow(dead_code, unused_imports))]
@@ -32,10 +32,10 @@ use jpeg_encoder::{rgb_to_ycbcr, Encoder, ImageBuffer, JpegColorType, SamplingFa
 use vita_log::{info, warn};
 
 /// The launcher writes this once the kernel helper is loaded.
-pub const READY_PATH: &str = "ux0:data/tailnet-listener/capture-ready";
+pub const READY_PATH: &str = "ux0:data/tailnet-listener/capture2-ready";
 
 const DEFAULT_QUALITY: u8 = 80;
-/// Rows fetched from the snapshot per call: 16 rows of 960 pixels is 60 KiB.
+/// Rows handed to the encoder per call: 16 rows of 960 pixels is 60 KiB.
 const ROWS_PER_READ: u32 = 16;
 const THREAD_STACK: usize = 128 * 1024;
 const REQUEST_WAIT: Duration = Duration::from_millis(400);
@@ -152,9 +152,9 @@ pub fn serve<S: FrameSource, C: Read + Write>(source: &mut S, conn: C) -> io::Re
             return Err(io::Error::new(io::ErrorKind::InvalidData, "empty frame"));
         }
         Err(code) => {
-            writeln!(out, "ERR no frame ({code})")?;
+            writeln!(out, "ERR no frame ({:08X})", code as u32)?;
             out.flush()?;
-            return Err(io::Error::new(io::ErrorKind::NotFound, format!("snapshot failed ({code})")));
+            return Err(io::Error::new(io::ErrorKind::NotFound, format!("snapshot failed ({:08X})", code as u32)));
         }
     };
     writeln!(out, "OK jpeg {} {}", info.width, info.height)?;
@@ -179,7 +179,7 @@ pub fn serve<S: FrameSource, C: Read + Write>(source: &mut S, conn: C) -> io::Re
     Ok(info)
 }
 
-/// The kernel helper (daemon/capture.h).
+/// The kernel helper (daemon/capture.h) and the memory block it fills.
 #[cfg(target_os = "vita")]
 mod kernel {
     use super::{FrameInfo, FrameSource};
@@ -196,14 +196,35 @@ mod kernel {
 
     extern "C" {
         fn tnCaptureGetApiVersion() -> i32;
-        fn tnCaptureSnapshot(info: *mut TnCaptureInfo) -> i32;
-        fn tnCaptureRead(first_row: u32, rows: u32, dst: *mut u8, dst_size: u32) -> i32;
-        fn tnCaptureRelease() -> i32;
+        fn tnCaptureFrame(info: *mut TnCaptureInfo, dst: *mut u8, dst_size: u32) -> i32;
+        fn sceKernelAllocMemBlock(name: *const u8, kind: u32, size: u32, opt: *mut u8) -> i32;
+        fn sceKernelGetMemBlockBase(uid: i32, base: *mut *mut u8) -> i32;
+        fn sceKernelFreeMemBlock(uid: i32) -> i32;
     }
 
-    pub const API_VERSION: i32 = 1;
+    pub const API_VERSION: i32 = 2;
+    const SCE_KERNEL_MEMBLOCK_TYPE_USER_RW: u32 = 0x0C20_D060;
+    /// The largest frame the helper copies: 1024 x 544 pixels, a whole
+    /// number of 4 KiB pages.
+    const FRAME_BYTES: u32 = 1024 * 544 * 4;
 
-    pub struct KernelSource;
+    /// The frame block, held from `snapshot` to `release`.
+    pub struct KernelSource {
+        block: i32,
+        base: *mut u8,
+        width: u32,
+        height: u32,
+    }
+
+    // SAFETY: the block is owned by this value alone and only reached
+    // through `&mut self`.
+    unsafe impl Send for KernelSource {}
+
+    impl KernelSource {
+        pub fn new() -> KernelSource {
+            KernelSource { block: -1, base: std::ptr::null_mut(), width: 0, height: 0 }
+        }
+    }
 
     /// Version of the loaded helper. Only call this when the launcher's
     /// ready file exists: with no helper loaded the import is unresolved.
@@ -214,30 +235,65 @@ mod kernel {
 
     impl FrameSource for KernelSource {
         fn snapshot(&mut self) -> Result<FrameInfo, i32> {
+            self.release();
+            // SAFETY: a null-terminated name, a valid type and size, no options.
+            let block = unsafe {
+                sceKernelAllocMemBlock(
+                    b"tailnet_frame\0".as_ptr(),
+                    SCE_KERNEL_MEMBLOCK_TYPE_USER_RW,
+                    FRAME_BYTES,
+                    std::ptr::null_mut(),
+                )
+            };
+            if block < 0 {
+                return Err(block);
+            }
+            let mut base = std::ptr::null_mut();
+            // SAFETY: `block` is a live block id and `base` a valid out-pointer.
+            let rc = unsafe { sceKernelGetMemBlockBase(block, &mut base) };
+            if rc < 0 || base.is_null() {
+                // SAFETY: `block` is a live block id.
+                unsafe { sceKernelFreeMemBlock(block) };
+                return Err(if rc < 0 { rc } else { -1 });
+            }
+            self.block = block;
+            self.base = base;
+
             let mut raw = TnCaptureInfo::default();
-            // SAFETY: `raw` is a valid out-parameter of the helper's layout.
-            let rc = unsafe { tnCaptureSnapshot(&mut raw) };
+            // SAFETY: `raw` has the helper's layout and `base` points at
+            // FRAME_BYTES writable bytes.
+            let rc = unsafe { tnCaptureFrame(&mut raw, base, FRAME_BYTES) };
             if rc < 0 {
+                self.release();
                 return Err(rc);
             }
+            self.width = raw.width;
+            self.height = raw.height;
             Ok(FrameInfo { width: raw.width, height: raw.height, owner_pid: raw.pid })
         }
 
         fn read_rows(&mut self, first_row: u32, rows: u32, dst: &mut [u8]) -> Result<(), i32> {
-            // SAFETY: the helper writes at most `dst.len()` bytes into `dst`.
-            let rc = unsafe { tnCaptureRead(first_row, rows, dst.as_mut_ptr(), dst.len() as u32) };
-            if rc < 0 {
-                Err(rc)
-            } else {
-                Ok(())
+            let row_bytes = self.width as usize * 4;
+            if self.base.is_null() || first_row + rows > self.height || dst.len() != rows as usize * row_bytes {
+                return Err(-1);
             }
+            // SAFETY: the helper filled `width * height * 4` bytes at `base`,
+            // and the range read here was just checked to lie inside them.
+            let src = unsafe { std::slice::from_raw_parts(self.base.add(first_row as usize * row_bytes), dst.len()) };
+            dst.copy_from_slice(src);
+            Ok(())
         }
 
         fn release(&mut self) {
-            // SAFETY: plain syscall, no arguments.
-            unsafe {
-                tnCaptureRelease();
+            if self.block >= 0 {
+                // SAFETY: `block` is a live block id; nothing points into it
+                // once `base` is cleared.
+                unsafe { sceKernelFreeMemBlock(self.block) };
             }
+            self.block = -1;
+            self.base = std::ptr::null_mut();
+            self.width = 0;
+            self.height = 0;
         }
     }
 }
@@ -266,7 +322,7 @@ pub fn start(port: u16) -> bool {
     let spawned = thread::Builder::new()
         .name("capture".into())
         .stack_size(THREAD_STACK)
-        .spawn(move || accept_loop(listener, kernel::KernelSource));
+        .spawn(move || accept_loop(listener, kernel::KernelSource::new()));
     match spawned {
         Ok(_) => {
             info!(port, "capture.listen");
@@ -284,7 +340,7 @@ pub fn start(_port: u16) -> bool {
     false
 }
 
-/// One client at a time: a capture holds the helper's only snapshot.
+/// One client at a time: there is one frame block.
 fn accept_loop<S: FrameSource>(listener: TcpListener, mut source: S) {
     for conn in listener.incoming() {
         let conn: TcpStream = match conn {
@@ -459,7 +515,7 @@ mod tests {
         fake.fail_snapshot = Some(-2);
         let mut conn = Conn::new("");
         assert!(serve(&mut fake, &mut conn).is_err());
-        assert_eq!(conn.reply, b"ERR no frame (-2)\n");
+        assert_eq!(conn.reply, b"ERR no frame (FFFFFFFE)\n");
     }
 
     #[test]
