@@ -243,7 +243,13 @@ fn bridge(
             Err(_) => break "tailnet-read",
         }
         if !busy && last.elapsed() >= idle {
-            break "idle-timeout";
+            // An FTP control channel is silent while its data connection
+            // carries a long transfer; it stays up as long as one runs.
+            if ftp.as_ref().is_some_and(FtpSession::transferring) {
+                last = Instant::now();
+            } else {
+                break "idle-timeout";
+            }
         }
     };
 
@@ -264,6 +270,24 @@ struct FtpSession {
     client: LineBuf,
     server: LineBuf,
     pending: Option<DataWaiter>,
+    /// Data connections of this session that are moving bytes now.
+    transfers: Arc<AtomicUsize>,
+}
+
+/// Counts one running data transfer for its control session.
+struct Transfer(Arc<AtomicUsize>);
+
+impl Transfer {
+    fn start(count: &Arc<AtomicUsize>) -> Transfer {
+        count.fetch_add(1, Ordering::AcqRel);
+        Transfer(Arc::clone(count))
+    }
+}
+
+impl Drop for Transfer {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 struct DataWaiter {
@@ -287,7 +311,18 @@ impl DataWaiter {
 
 impl FtpSession {
     fn new(sh: Arc<Shared>, peer: SocketAddr) -> FtpSession {
-        FtpSession { sh, peer, client: LineBuf::default(), server: LineBuf::default(), pending: None }
+        FtpSession {
+            sh,
+            peer,
+            client: LineBuf::default(),
+            server: LineBuf::default(),
+            pending: None,
+            transfers: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn transferring(&self) -> bool {
+        self.transfers.load(Ordering::Acquire) > 0
     }
 
     /// Client -> companion. Active-mode commands are answered here.
@@ -359,13 +394,14 @@ impl FtpSession {
         let sh = Arc::clone(&self.sh);
         let peer_ip = self.peer.ip();
         let (c, a) = (Arc::clone(&cancel), Arc::clone(&accepted));
+        let transfers = Arc::clone(&self.transfers);
         let handle = thread::Builder::new()
             .name("ftp-data".into())
             .stack_size(CONN_STACK)
             .spawn(move || {
                 let _slot = slot;
                 let _live = live;
-                data_conn(sh, listener, port, peer_ip, c, a);
+                data_conn(sh, listener, port, peer_ip, c, a, transfers);
             })
             .map_err(|e| e.to_string())?;
         self.pending = Some(DataWaiter { cancel, accepted, handle: Some(handle) });
@@ -390,6 +426,7 @@ fn data_conn(
     peer_ip: std::net::IpAddr,
     cancel: Arc<AtomicBool>,
     accepted: Arc<AtomicBool>,
+    transfers: Arc<AtomicUsize>,
 ) {
     let deadline = Instant::now() + DATA_ACCEPT_TIMEOUT;
     let (ts, peer) = loop {
@@ -422,6 +459,24 @@ fn data_conn(
             return;
         }
     };
+    let _transfer = Transfer::start(&transfers);
     let (reason, up, down) = bridge(&sh, ts, local, sh.data_idle, None);
     info!(%peer, port, reason, bytes_in = up, bytes_out = down, "ftp.data.close");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transfer_guard_counts_running_transfers() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let a = Transfer::start(&count);
+        let b = Transfer::start(&count);
+        assert_eq!(count.load(Ordering::Acquire), 2);
+        drop(a);
+        assert_eq!(count.load(Ordering::Acquire), 1);
+        drop(b);
+        assert_eq!(count.load(Ordering::Acquire), 0);
+    }
 }
