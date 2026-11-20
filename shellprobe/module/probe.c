@@ -4,12 +4,13 @@
  * ur0:tai/config.txt). One 16 KiB thread wakes every SAMPLE_SEC seconds and
  * appends a line to LOG_PATH:
  *
- *   t=14:02:10 up=312s free_kb user=1234 cdram=0 phycont=0 apps=PCSG00001
+ *   t=14:02:10 up=312s rc=0 free_kb user=1234 cdram=0 phycont=0 apps=PCSG00001
  *
  * Every LADDER_EVERY-th sample it also allocates and at once frees one block
  * of each memory type, largest size first, and logs the largest size that
- * succeeded ("max_mb"). That number says what a plugin could really get,
- * which the free counters alone do not.
+ * succeeded ("max_kb") and the error of the last size that failed. That
+ * number says what a plugin could really get, which the free counters alone
+ * do not.
  *
  * The thread stops after MAX_MINUTES, or as soon as STOP_PATH exists.
  * No libc: only SCE calls, so there is no heap and nothing to initialise.
@@ -29,12 +30,17 @@
 #define LOG_PATH  DIR_PATH "/shellmem.log"
 #define STOP_PATH DIR_PATH "/stop"
 
-#define SAMPLE_SEC   10
-#define LADDER_EVERY 3
+#define SAMPLE_SEC   5
+#define LADDER_EVERY 2
 #define MAX_MINUTES  90
 
-static const unsigned LADDER_MB[] = { 32, 24, 16, 12, 8, 6, 4, 3, 2, 1 };
-#define N_LADDER (sizeof LADDER_MB / sizeof LADDER_MB[0])
+/* Block sizes tried, largest first, in KiB. CDRAM blocks must be multiples
+ * of 256 KiB and physically contiguous ones multiples of 1 MiB, so those
+ * types stop at their own smallest step. */
+static const unsigned LADDER_KB[] = {
+    32768, 24576, 16384, 12288, 8192, 6144, 4096, 3072, 2048, 1024, 512, 256, 64,
+};
+#define N_LADDER (sizeof LADDER_KB / sizeof LADDER_KB[0])
 
 static void log_line(const char *msg)
 {
@@ -46,16 +52,19 @@ static void log_line(const char *msg)
     sceIoClose(fd);
 }
 
-/* Largest block of `type` that can be allocated right now, in MiB. The block
- * is freed straight away. */
-static unsigned max_alloc_mb(SceKernelMemBlockType type)
+/* Largest block of `type` that can be allocated right now, in KiB, trying no
+ * size below `min_kb`. The block is freed straight away. `*err` gets the
+ * error of the last size that failed (0 if the first try worked). */
+static unsigned max_alloc_kb(SceKernelMemBlockType type, unsigned min_kb, int *err)
 {
-    for (unsigned i = 0; i < N_LADDER; i++) {
-        SceUID blk = sceKernelAllocMemBlock("tnprobe", type, LADDER_MB[i] << 20, NULL);
+    *err = 0;
+    for (unsigned i = 0; i < N_LADDER && LADDER_KB[i] >= min_kb; i++) {
+        SceUID blk = sceKernelAllocMemBlock("tnprobe", type, LADDER_KB[i] << 10, NULL);
         if (blk >= 0) {
             sceKernelFreeMemBlock(blk);
-            return LADDER_MB[i];
+            return LADDER_KB[i];
         }
+        *err = blk;
     }
     return 0;
 }
@@ -132,11 +141,13 @@ static int probe_main(SceSize args, void *argp)
                                 mi.size_user / 1024, mi.size_cdram / 1024,
                                 mi.size_phycont / 1024);
         if (n % LADDER_EVERY == 0 && w > 0 && (unsigned)w < sizeof line) {
+            int eu, ec, ep;
+            unsigned ku = max_alloc_kb(SCE_KERNEL_MEMBLOCK_TYPE_USER_RW, 64, &eu);
+            unsigned kc = max_alloc_kb(SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW, 256, &ec);
+            unsigned kp = max_alloc_kb(SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_RW, 1024, &ep);
             w += sceClibSnprintf(line + w, sizeof line - w,
-                                 " max_mb user=%u cdram=%u phycont=%u",
-                                 max_alloc_mb(SCE_KERNEL_MEMBLOCK_TYPE_USER_RW),
-                                 max_alloc_mb(SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW),
-                                 max_alloc_mb(SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_RW));
+                                 " max_kb user=%u cdram=%u phycont=%u err=%X/%X/%X",
+                                 ku, kc, kp, (unsigned)eu, (unsigned)ec, (unsigned)ep);
         }
         if (w > 0 && (unsigned)w < sizeof line)
             sceClibSnprintf(line + w, sizeof line - w, " apps=%s", apps);

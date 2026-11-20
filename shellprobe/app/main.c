@@ -118,7 +118,7 @@ int main(void)
             SceUID fd = sceIoOpen(STOP_PATH, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0666);
             if (fd >= 0)
                 sceIoClose(fd);
-            say("stop file written (%08X); the probe stops within 10 s", (unsigned)fd);
+            say("stop file written (%08X); the probe stops within 5 s", (unsigned)fd);
             loaded = 0;
         }
         if ((pressed & SCE_CTRL_CROSS) && shell >= 0 && n > 0) {
