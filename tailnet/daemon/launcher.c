@@ -248,7 +248,8 @@ int main(void)
 
     int rc = sceSysmoduleLoadModule(SCE_SYSMODULE_BG_APP_UTIL);
     say("launcher: load BG_APP_UTIL -> %08X", (unsigned)rc);
-    /* BGFTP passes 0; VitaSDK's header says 1. 0 works on firmware 3.65. */
+    /* VitaSDK's header says the mode must be 1, but 0 is what works on
+     * firmware 3.65; 1 is tried only if 0 is refused. */
     rc = sceBgAppUtilStartBgApp(0);
     say("launcher: StartBgApp(0) -> %08X", (unsigned)rc);
     if (rc < 0) {

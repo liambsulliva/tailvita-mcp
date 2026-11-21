@@ -11,7 +11,7 @@ endif()
 project(tailnet_daemon_launcher C)
 include("${VITASDK}/share/vita.cmake" REQUIRED)
 
-# The launcher bubble. Like BGFTP's, it is a system-mode app with a 4 MiB
+# The launcher bubble. It is a system-mode app with a 4 MiB
 # budget, so it can open beside a running game.
 add_executable(launcher launcher.c)
 target_compile_options(launcher PRIVATE -Wall -O2 -std=gnu11)

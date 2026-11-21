@@ -1,66 +1,77 @@
 #!/usr/bin/env python3
-"""Generate a bgapp VPK's param.sfo (gdc launcher) + param2.sfo (gdd
-service) as structural clones of BGFTP v3.24's released SFO pair.
+"""Write the two SFO files of a background-app package: param.sfo for the
+launcher bubble and param2.sfo for the service.
 
-Why cloning, not vita-mksfoex: from-scratch SFOs (M21 spike round 1)
-registered fine in app.db but the bgapp spawn failed; cloning the exact
-key set / fmt / dmax of a known-working package removes every structural
-variable at once. Only identity values are swapped. The reference pair
-lives in spikes/06-bgapp/reference/ (dumped from the installed BGFTP).
+The key sets, value types and field sizes below are the ones a working
+background-app package uses. tailscale-vita's M21 spike found that SFOs made
+with vita-mksfoex (more keys, an empty CONTENT_ID) install and register but
+the service then fails to start, so the layout is fixed here and only the
+identity values are passed in.
 
-CONTENT_ID scheme (BGFTP-faithful): HB0000-<TITLE_ID>_00-<TAIL>, TAIL a
-16-char suffix shared by both halves; the installer normalizes the gdd's
-CONTENT_ID to the parent's at install time. INSTALL_DIR_ADDCONT/SAVEDATA
-on the gdd point back at the gdc's TITLE_ID.
+CONTENT_ID is HB0000-<TITLE_ID>_00-<TAIL>, with one 16-character TAIL for
+both halves. The service's INSTALL_DIR_ADDCONT and INSTALL_DIR_SAVEDATA name
+the launcher's TITLE_ID.
 """
 import argparse
 import struct
 from pathlib import Path
 
+TEXT, NUMBER = 0x0204, 0x0404
 
-def read_sfo(path):
-    d = path.read_bytes()
-    magic, _ver, kofs, dofs, n = struct.unpack("<IIIII", d[:20])
-    assert magic == 0x46535000, path
-    entries = []
-    for i in range(n):
-        ko, fmt, dlen, dmax, do = struct.unpack("<HHIII", d[20 + i * 16 : 36 + i * 16])
-        key = d[kofs + ko : d.index(b"\0", kofs + ko)].decode()
-        entries.append({"key": key, "fmt": fmt, "dmax": dmax,
-                        "data": d[dofs + do : dofs + do + dlen]})
-    return entries
+# (key, type, field size, value). None is filled in from the arguments.
+LAUNCHER = [
+    ("APP_VER", TEXT, 8, None),
+    ("ATTRIBUTE", NUMBER, 4, 0x01009000),
+    ("ATTRIBUTE2", NUMBER, 4, 0),
+    ("ATTRIBUTE_MINOR", NUMBER, 4, 17),
+    ("CATEGORY", TEXT, 4, "gdc"),
+    ("CONTENT_ID", TEXT, 48, None),
+    ("GC_RO_SIZE", NUMBER, 4, 0),
+    ("GC_RW_SIZE", NUMBER, 4, 0),
+    ("PARENTAL_LEVEL", NUMBER, 4, 1),
+    ("PSP2_DISP_VER", TEXT, 8, "03.600"),
+    ("PSP2_SYSTEM_VER", NUMBER, 4, 0x03600000),
+    ("REGION_DENY", NUMBER, 4, 0),
+    ("SAVEDATA_MAX_SIZE", NUMBER, 4, 1048576),
+    ("STITLE", TEXT, 52, None),
+    ("TITLE", TEXT, 128, None),
+    ("TITLE_ID", TEXT, 12, None),
+    ("VERSION", TEXT, 8, "01.00"),
+]
+SERVICE = [
+    ("APP_VER", TEXT, 8, None),
+    ("ATTRIBUTE", NUMBER, 4, 0x00081000),
+    ("ATTRIBUTE2", NUMBER, 4, 0),
+    ("CATEGORY", TEXT, 4, "gdd"),
+    ("CONTENT_ID", TEXT, 48, None),
+    ("INSTALL_DIR_ADDCONT", TEXT, 12, None),
+    ("INSTALL_DIR_SAVEDATA", TEXT, 12, None),
+    ("PARENTAL_LEVEL", NUMBER, 4, 1),
+    ("REGION_DENY", NUMBER, 4, 0),
+    ("SAVEDATA_MAX_SIZE", NUMBER, 4, 1048576),
+    ("STITLE", TEXT, 52, None),
+    ("TITLE", TEXT, 128, None),
+    ("TITLE_ID", TEXT, 12, None),
+    ("VERSION", TEXT, 8, "01.00"),
+]
 
 
-def write_sfo(entries, path):
-    key_table = b""
-    key_offsets = []
-    for e in entries:
-        key_offsets.append(len(key_table))
-        key_table += e["key"].encode() + b"\0"
-    while len(key_table) % 4:
-        key_table += b"\0"
-
-    data_table = b""
-    index = b""
-    for e, ko in zip(entries, key_offsets):
-        do = len(data_table)
-        data = e["data"]
-        assert len(data) <= e["dmax"], f"{e['key']} exceeds dmax"
-        index += struct.pack("<HHIII", ko, e["fmt"], len(data), e["dmax"], do)
-        data_table += data + b"\0" * (e["dmax"] - len(data))
-
-    kofs = 20 + len(index)
-    dofs = kofs + len(key_table)
-    hdr = struct.pack("<IIIII", 0x46535000, 0x101, kofs, dofs, len(entries))
-    path.write_bytes(hdr + index + key_table + data_table)
-
-
-def set_str(entries, key, value):
-    for e in entries:
-        if e["key"] == key:
-            e["data"] = value.encode() + b"\0"
-            return
-    raise KeyError(key)
+def build_sfo(layout, values):
+    """The SFO bytes for `layout`, with the None entries taken from `values`."""
+    keys, index, data = b"", b"", b""
+    for key, kind, size, value in layout:
+        if value is None:
+            value = values[key]
+        raw = struct.pack("<I", value) if kind == NUMBER else value.encode() + b"\0"
+        if len(raw) > size:
+            raise ValueError(f"{key}: {value!r} does not fit in {size} bytes")
+        index += struct.pack("<HHIII", len(keys), kind, len(raw), size, len(data))
+        keys += key.encode() + b"\0"
+        data += raw.ljust(size, b"\0")
+    keys += b"\0" * (-len(keys) % 4)
+    key_start = 20 + len(index)
+    header = struct.pack("<IIIII", 0x46535000, 0x101, key_start, key_start + len(keys), len(layout))
+    return header + index + keys + data
 
 
 def content_id(title_id, tail):
@@ -68,43 +79,39 @@ def content_id(title_id, tail):
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--ref", required=True, type=Path,
-                    help="dir holding bgftp_param.sfo + bgftp_param2.sfo")
-    ap.add_argument("--out", required=True, type=Path,
-                    help="dir to write param.sfo + param2.sfo into")
-    ap.add_argument("--gdc-id", required=True, help="launcher TITLE_ID (9 chars)")
-    ap.add_argument("--gdc-title", required=True)
-    ap.add_argument("--gdd-id", required=True, help="service TITLE_ID (9 chars)")
-    ap.add_argument("--gdd-title", required=True)
-    ap.add_argument("--tail", required=True,
-                    help="16-char CONTENT_ID suffix shared by both halves")
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--out", required=True, type=Path, help="folder to write param.sfo and param2.sfo into")
+    ap.add_argument("--launcher-id", required=True, help="launcher TITLE_ID (9 characters)")
+    ap.add_argument("--launcher-title", required=True)
+    ap.add_argument("--service-id", required=True, help="service TITLE_ID (9 characters)")
+    ap.add_argument("--service-title", required=True)
+    ap.add_argument("--tail", required=True, help="16-character CONTENT_ID suffix shared by both halves")
     ap.add_argument("--app-ver", default="01.00")
     args = ap.parse_args()
 
-    assert len(args.gdc_id) == 9 and len(args.gdd_id) == 9, "TITLE_ID must be 9 chars"
-    assert len(args.tail) == 16, "--tail must be exactly 16 chars"
+    if len(args.launcher_id) != 9 or len(args.service_id) != 9:
+        ap.error("a TITLE_ID is 9 characters")
+    if len(args.tail) != 16:
+        ap.error("--tail is 16 characters")
 
-    launcher = read_sfo(args.ref / "bgftp_param.sfo")
-    set_str(launcher, "APP_VER", args.app_ver)
-    set_str(launcher, "CONTENT_ID", content_id(args.gdc_id, args.tail))
-    set_str(launcher, "STITLE", args.gdc_title)
-    set_str(launcher, "TITLE", args.gdc_title)
-    set_str(launcher, "TITLE_ID", args.gdc_id)
-    write_sfo(launcher, args.out / "param.sfo")
-
-    bgapp = read_sfo(args.ref / "bgftp_param2.sfo")
-    set_str(bgapp, "APP_VER", args.app_ver)
-    set_str(bgapp, "CONTENT_ID", content_id(args.gdd_id, args.tail))
-    set_str(bgapp, "INSTALL_DIR_ADDCONT", args.gdc_id)
-    set_str(bgapp, "INSTALL_DIR_SAVEDATA", args.gdc_id)
-    set_str(bgapp, "STITLE", args.gdd_title)
-    set_str(bgapp, "TITLE", args.gdd_title)
-    set_str(bgapp, "TITLE_ID", args.gdd_id)
-    write_sfo(bgapp, args.out / "param2.sfo")
-
-    print(f"wrote {args.out}/param.sfo ({args.gdc_id} \"{args.gdc_title}\") + "
-          f"param2.sfo ({args.gdd_id} \"{args.gdd_title}\")")
+    (args.out / "param.sfo").write_bytes(build_sfo(LAUNCHER, {
+        "APP_VER": args.app_ver,
+        "CONTENT_ID": content_id(args.launcher_id, args.tail),
+        "STITLE": args.launcher_title,
+        "TITLE": args.launcher_title,
+        "TITLE_ID": args.launcher_id,
+    }))
+    (args.out / "param2.sfo").write_bytes(build_sfo(SERVICE, {
+        "APP_VER": args.app_ver,
+        "CONTENT_ID": content_id(args.service_id, args.tail),
+        "INSTALL_DIR_ADDCONT": args.launcher_id,
+        "INSTALL_DIR_SAVEDATA": args.launcher_id,
+        "STITLE": args.service_title,
+        "TITLE": args.service_title,
+        "TITLE_ID": args.service_id,
+    }))
+    print(f"wrote {args.out}/param.sfo ({args.launcher_id} \"{args.launcher_title}\") and "
+          f"param2.sfo ({args.service_id} \"{args.service_title}\")")
 
 
 if __name__ == "__main__":

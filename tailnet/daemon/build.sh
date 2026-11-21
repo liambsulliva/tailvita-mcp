@@ -6,8 +6,8 @@
 #   eboot2.bin  the service: tailnet-listener built with `--features daemon`,
 #               in a SELF that carries a memory budget.
 #
-# The layout and the SFO pair follow GrapheneCt's BGFTP, by way of the
-# tailscale-vita M21 spike (sfo_make.py, reference/, assets/ are from there).
+# The two-program layout and the SFO pair (sfo_make.py) are what a Vita
+# background-app package needs; see THIRD_PARTY.md for where they come from.
 #
 # Run on the NAS:  nice -n 15 ./build.sh
 set -euo pipefail
@@ -34,6 +34,7 @@ CONTENT_TAIL="TAILNETDAEMON000"
 # more 2.0 MiB block for the frame (src/capture.rs). 15 MiB leaves about
 # 2 MiB spare. A background service is the first thing the system ends when
 # memory runs short beside an enlarged-memory game, so smaller is safer.
+# (16 MiB was the first value tried and is known to start beside one.)
 MEMSIZE_KB=15360
 ATTRIBUTE=3
 
@@ -60,9 +61,9 @@ print(f"    ATTRIBUTE={attr} MEMSIZE={memsize} KiB at {at:#x}")
 PY
 
 echo "==> param.sfo / param2.sfo"
-python3 "$HERE/sfo_make.py" --ref "$HERE/reference" --out "$OUT" \
-  --gdc-id "$LAUNCHER_ID" --gdc-title "$LAUNCHER_TITLE" \
-  --gdd-id "$SERVICE_ID" --gdd-title "$SERVICE_TITLE" \
+python3 "$HERE/sfo_make.py" --out "$OUT" \
+  --launcher-id "$LAUNCHER_ID" --launcher-title "$LAUNCHER_TITLE" \
+  --service-id "$SERVICE_ID" --service-title "$SERVICE_TITLE" \
   --tail "$CONTENT_TAIL"
 
 echo "==> vpk"
