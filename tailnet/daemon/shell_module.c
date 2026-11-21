@@ -11,9 +11,12 @@
  *    system may end one again when memory runs short. While KEEP_PATH exists,
  *    one small thread checks every POLL_SEC seconds whether the service is
  *    running and starts it again after it has been gone for GONE_POLLS
- *    checks. It gives up after MAX_FAILS refused starts in a row, or after
- *    MAX_BLIND starts that did not bring the service up, until the service
- *    is seen running again (opening the bubble starts it).
+ *    checks. A start can report success and the service still never appear
+ *    (seen on 2026-11-20 and 21), so each start is followed for FOLLOW_MS and
+ *    the wait before the next one doubles, up to MAX_WAIT_POLLS checks. The
+ *    wait goes back to GONE_POLLS once the service has stayed up for
+ *    STEADY_POLLS checks. Before each start the titles that are running are
+ *    logged, to show what the service could not start beside.
  *
  * The launcher loads this module into SceShell at run time, so nothing is
  * listed in ur0:tai/config.txt and it is gone after a reboot. A second copy
@@ -33,12 +36,17 @@
 #define LOG_PATH   DIR_PATH "/launcher.log"
 /* Written by the launcher on start, removed when it is opened with L held. */
 #define KEEP_PATH  DIR_PATH "/keepalive"
+/* Says the kernel capture helper was loaded during this boot. This module
+ * starts once per boot, so a marker it finds on a real start is a stale one. */
+#define CAP_READY  DIR_PATH "/capture2-ready"
 #define SERVICE_ID "TVIT00014"
 
-#define POLL_SEC   5
-#define GONE_POLLS 3
-#define MAX_FAILS  3
-#define MAX_BLIND  4
+#define POLL_SEC       5
+#define GONE_POLLS     3
+#define MAX_WAIT_POLLS 60
+#define STEADY_POLLS   12
+#define FOLLOW_MS      5000
+#define FOLLOW_STEP_MS 250
 
 static SceUID g_hook = -1;
 static tai_hook_ref_t g_ref;
@@ -86,22 +94,65 @@ static int service_running(int *rc_out)
     return rc >= 0 && pid > 0;
 }
 
+/* One line naming every running title, e.g. "shell: running: GHTR00001". */
+static void log_running_apps(void)
+{
+    char line[160];
+    SceInt32 ids[12];
+    int n = sceAppMgrGetRunningAppIdListForShell(ids, 12);
+    int len = sceClibSnprintf(line, sizeof line, "shell: running (%d):", n);
+    for (int i = 0; i < n && i < 12 && len < (int)sizeof line - 16; i++) {
+        char name[32];
+        sceClibMemset(name, 0, sizeof name);
+        SceUID pid = sceAppMgrGetProcessIdByAppIdForShell(ids[i]);
+        if (pid < 0 || sceAppMgrGetNameById(pid, name) < 0)
+            sceClibSnprintf(name, sizeof name, "?%08X", (unsigned)ids[i]);
+        name[12] = 0;
+        len += sceClibSnprintf(line + len, sizeof line - len, " %s", name);
+    }
+    say(line);
+}
+
+/* Watch a start for FOLLOW_MS and log what became of it. */
+static void follow_start(void)
+{
+    char line[160];
+    int rc, seen_at = -1;
+    for (int ms = FOLLOW_STEP_MS; ms <= FOLLOW_MS; ms += FOLLOW_STEP_MS) {
+        sceKernelDelayThread(FOLLOW_STEP_MS * 1000);
+        int running = service_running(&rc);
+        if (running && seen_at < 0) {
+            seen_at = ms;
+        } else if (!running && seen_at >= 0) {
+            sceClibSnprintf(line, sizeof line, "shell: service appeared after %d ms and was gone at %d ms (rc %08X)",
+                            seen_at, ms, (unsigned)rc);
+            say(line);
+            return;
+        }
+    }
+    if (seen_at >= 0)
+        sceClibSnprintf(line, sizeof line, "shell: service appeared after %d ms", seen_at);
+    else
+        sceClibSnprintf(line, sizeof line, "shell: service did not appear within %d ms (rc %08X)",
+                        FOLLOW_MS, (unsigned)rc);
+    say(line);
+}
+
 static int watchdog_main(SceSize args, void *argp)
 {
     (void)args;
     (void)argp;
     char line[160];
     int last = -1;          /* last logged state: 1 running, 0 gone */
-    unsigned gone = 0, fails = 0, blind = 0;
-    int gave_up = 0;
+    unsigned gone = 0, steady = 0, wait = GONE_POLLS;
 
     for (;;) {
         sceKernelDelayThread(POLL_SEC * 1000000);
         SceIoStat st;
         if (sceIoGetstat(KEEP_PATH, &st) < 0) {
             /* Not asked to keep it up: forget everything and wait. */
-            gone = fails = blind = 0;
-            gave_up = 0;
+            gone = steady = 0;
+            wait = GONE_POLLS;
             last = -1;
             continue;
         }
@@ -114,27 +165,23 @@ static int watchdog_main(SceSize args, void *argp)
             last = running;
         }
         if (running) {
-            gone = fails = blind = 0;
-            gave_up = 0;
+            gone = 0;
+            if (++steady >= STEADY_POLLS)
+                wait = GONE_POLLS;
             continue;
         }
-        if (gave_up || ++gone < GONE_POLLS)
+        steady = 0;
+        if (++gone < wait)
             continue;
         gone = 0;
-        /* `blind` counts starts since the service was last seen running. A
-         * start can report success and the service still never appear (seen
-         * on 2026-11-20), so the count applies whether or not it ever ran. */
-        if (fails >= MAX_FAILS || blind >= MAX_BLIND) {
-            say("shell: giving up on restarts until the service is seen running again");
-            gave_up = 1;
-            continue;
-        }
+        log_running_apps();
         SceUID app = sceAppMgrLaunchAppByName2ForShell(SERVICE_ID, NULL, NULL);
-        sceClibSnprintf(line, sizeof line, "shell: start service -> %08X", (unsigned)app);
+        sceClibSnprintf(line, sizeof line, "shell: start service -> %08X (next try in %u s if it does not stay up)",
+                        (unsigned)app, (wait * 2 > MAX_WAIT_POLLS ? MAX_WAIT_POLLS : wait * 2) * POLL_SEC);
         say(line);
-        if (app < 0)
-            fails++;
-        blind++;
+        if (app >= 0)
+            follow_start();
+        wait = wait * 2 > MAX_WAIT_POLLS ? MAX_WAIT_POLLS : wait * 2;
     }
     return 0;
 }
@@ -151,6 +198,9 @@ int module_start(SceSize argc, const void *args)
         say("shell: already loaded in this shell; not loading twice");
         return SCE_KERNEL_START_NO_RESIDENT;
     }
+    /* First start in this SceShell: whatever the marker says is from an
+     * earlier boot. The launcher writes it again after loading the helper. */
+    sceIoRemove(CAP_READY);
 
     tai_module_info_t info;
     sceClibMemset(&info, 0, sizeof info);

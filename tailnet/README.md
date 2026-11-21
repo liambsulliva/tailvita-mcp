@@ -127,8 +127,15 @@ Two things learned the hard way:
 
 - A process can only call the helper if it started after the helper was
   loaded. The launcher loads it and must not call it; it writes
-  `capture2-ready` (boot time and SceShell's pid) so it loads the helper
-  once per boot, and the service offers the port only when that file exists.
+  `capture2-ready`, and the service offers the port only when that file
+  exists.
+- The helper must be loaded exactly once per boot. The launcher loads it only
+  when its SceShell module was loaded by the same open of the bubble, which
+  happens once per boot, and that module removes a `capture2-ready` left from
+  an earlier boot. The first scheme compared boot times, which drift by
+  however long the Vita has slept: on 2026-11-21, after a night asleep, the
+  launcher tried a second load (refused with `8002D013`, and the service then
+  did not start) and a third, after which the Vita shut itself down.
 - A small negative return value from a syscall reaches the caller with bit
   30 cleared (-7 arrived as `0xBFFFFFF9`), so the helper returns SCE-style
   `0x80F7xxxx` codes. Its first version also asked the kernel for a 2 MiB
@@ -153,9 +160,10 @@ followed by opening the bubble. `vita launch TVIT00013` opens it too, but
 only from the home screen (with a game in front the launch is ignored).
 
 Files that switch things off, in `ux0:data/tailnet-listener/`:
-`no-shell-module` (the launcher leaves SceShell alone), `no-capture` (the
-kernel helper is not loaded), `stop` (the service exits; the launcher
-removes it on a normal start).
+`no-shell-module` (the launcher leaves SceShell alone and loads no kernel
+helper), `no-capture` (the kernel helper is not loaded; it counts on the
+first open after a boot), `stop` (the service exits; the launcher removes it
+on a normal start).
 
 If something goes wrong: the bubble's parts live only in memory, so a
 restart of the Vita removes the SceShell module and the kernel helper, and

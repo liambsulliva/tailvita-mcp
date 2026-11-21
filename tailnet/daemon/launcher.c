@@ -26,7 +26,6 @@
 #include <psp2/kernel/clib.h>
 #include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/threadmgr.h>
-#include <psp2/rtc.h>
 #include <psp2/sysmodule.h>
 #include <stdarg.h>
 #include <taihen.h>
@@ -39,9 +38,10 @@
 #define NO_HOOK  DIR_PATH "/no-shell-module"
 #define CAP_SRC  "app0:tailnet_capture.skprx"
 #define CAP_DST  DIR_PATH "/tailnet_capture.skprx"
-/* Written once the kernel helper is loaded: "<boot time> <SceShell pid>".
- * The 2 matches the helper's interface generation (tailnet_capture.yml).
- * The service offers screenshots only while it exists. */
+/* Written once the kernel helper is loaded; holds SceShell's pid. The 2
+ * matches the helper's interface generation (tailnet_capture.yml). The
+ * service offers screenshots only while it exists. The SceShell module
+ * removes it on its first start of a boot. */
 #define CAP_READY DIR_PATH "/capture2-ready"
 /* Leave the kernel alone when this file exists. */
 #define NO_CAPTURE DIR_PATH "/no-capture"
@@ -104,67 +104,45 @@ static SceUID find_shell(void)
     return shell;
 }
 
-static void load_shell_module(SceUID shell)
+/* True only when the module was loaded by this call and stayed: the first
+ * time the bubble is opened after a boot. A copy that finds itself already
+ * there answers 80024501, as does one that could not install its hook. */
+static int load_shell_module(SceUID shell)
 {
     SceIoStat st;
     if (sceIoGetstat(NO_HOOK, &st) >= 0) {
         say("launcher: %s exists; SceShell left alone", NO_HOOK);
-        return;
+        return 0;
     }
     int n = copy_file(MOD_SRC, MOD_DST);
     if (n <= 0) {
         say("launcher: copying the shell module failed (%08X)", (unsigned)n);
-        return;
+        return 0;
     }
     SceUID mod = taiLoadStartModuleForPid(shell, MOD_DST, 0, NULL, 0);
     say("launcher: shell module into SceShell pid %08X -> %08X", (unsigned)shell, (unsigned)mod);
+    return mod >= 0;
 }
 
-/* When this boot started, in seconds on the RTC's scale. */
-static unsigned long long boot_seconds(void)
-{
-    SceRtcTick now = { 0 };
-    sceRtcGetCurrentTick(&now);
-    return (now.tick - sceKernelGetSystemTimeWide()) / 1000000ULL;
-}
-
-/* True if CAP_READY was written during this boot: the same SceShell pid and
- * a boot time within two minutes. A kernel module must not be loaded
- * twice, and nothing else says whether ours is already there. */
-static int capture_ready_this_boot(SceUID shell)
-{
-    char buf[64] = { 0 };
-    SceUID fd = sceIoOpen(CAP_READY, SCE_O_RDONLY, 0);
-    if (fd < 0)
-        return 0;
-    int n = sceIoRead(fd, buf, sizeof buf - 1);
-    sceIoClose(fd);
-    if (n <= 0)
-        return 0;
-    unsigned long long boot = 0;
-    unsigned pid = 0;
-    const char *p = buf;
-    while (*p >= '0' && *p <= '9')
-        boot = boot * 10 + (unsigned)(*p++ - '0');
-    while (*p == ' ')
-        p++;
-    while (*p >= '0' && *p <= '9')
-        pid = pid * 10 + (unsigned)(*p++ - '0');
-    unsigned long long now = boot_seconds();
-    unsigned long long apart = now > boot ? now - boot : boot - now;
-    return pid == (unsigned)shell && apart <= 120;
-}
-
-static void load_capture_module(SceUID shell)
+/* Loads the kernel helper, once per boot.
+ *
+ * A kernel module must not be loaded twice. On 2026-11-21 a second load was
+ * refused with 8002D013 and the service then failed to start; a third was
+ * followed by the Vita shutting down. Nothing in user mode says whether the
+ * helper is already there, so the load is tied to the one event that happens
+ * once per boot: the SceShell module being loaded for the first time
+ * (`first_open`). An earlier version compared boot times instead, which
+ * drifts by however long the Vita has slept. */
+static void load_capture_module(SceUID shell, int first_open)
 {
     SceIoStat st;
     if (sceIoGetstat(NO_CAPTURE, &st) >= 0) {
-        sceIoRemove(CAP_READY);
         say("launcher: %s exists; kernel helper not loaded", NO_CAPTURE);
         return;
     }
-    if (capture_ready_this_boot(shell)) {
-        say("launcher: kernel helper already loaded this boot");
+    if (!first_open) {
+        say("launcher: not the first open of this boot; kernel helper left as it is (%s)",
+            sceIoGetstat(CAP_READY, &st) >= 0 ? "loaded" : "not loaded");
         return;
     }
     sceIoRemove(CAP_READY);
@@ -178,25 +156,12 @@ static void load_capture_module(SceUID shell)
     if (mod < 0)
         return;
 
-    /* Record it at once: a second load of a kernel module must not happen.
-     * This process cannot call the helper itself, because its imports were
-     * bound when it started, before the helper existed; the service starts
-     * afterwards and checks the helper's version before offering
-     * screenshots. */
-    /* "<boot seconds> <pid>\n"; the boot time is written digit by digit
-     * because it does not fit the 32-bit formats. */
-    char digits[24];
-    int nd = 0;
-    unsigned long long boot = boot_seconds();
-    do {
-        digits[nd++] = (char)('0' + boot % 10);
-        boot /= 10;
-    } while (boot && nd < (int)sizeof digits);
-    char buf[64];
-    int len = 0;
-    while (nd > 0)
-        buf[len++] = digits[--nd];
-    len += sceClibSnprintf(buf + len, sizeof buf - len, " %u\n", (unsigned)shell);
+    /* Record it at once. This process cannot call the helper itself, because
+     * its imports were bound when it started, before the helper existed; the
+     * service starts afterwards and checks the helper's version before
+     * offering screenshots. */
+    char buf[32];
+    int len = sceClibSnprintf(buf, sizeof buf, "%u\n", (unsigned)shell);
     SceUID fd = sceIoOpen(CAP_READY, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0666);
     if (fd >= 0) {
         sceIoWrite(fd, buf, len);
@@ -241,10 +206,8 @@ int main(void)
 
     sceIoRemove(STOP_PATH);
     SceUID shell = find_shell();
-    if (shell >= 0) {
-        load_shell_module(shell);
-        load_capture_module(shell);
-    }
+    if (shell >= 0)
+        load_capture_module(shell, load_shell_module(shell));
 
     int rc = sceSysmoduleLoadModule(SCE_SYSMODULE_BG_APP_UTIL);
     say("launcher: load BG_APP_UTIL -> %08X", (unsigned)rc);

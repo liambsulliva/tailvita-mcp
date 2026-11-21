@@ -16,7 +16,6 @@ include("${VITASDK}/share/vita.cmake" REQUIRED)
 add_executable(launcher launcher.c)
 target_compile_options(launcher PRIVATE -Wall -O2 -std=gnu11)
 target_link_libraries(launcher
-  SceRtc_stub
   taihen_stub
   SceBgAppUtil_stub
   SceAppMgr_stub
