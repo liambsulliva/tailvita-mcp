@@ -140,12 +140,17 @@ interface changes, bump the `2` in `tailnet_capture.yml` and in
 
 ### Install and stop
 
-Over the LAN, `vita install tailnet/daemon/build/tailnet-daemon.vpk` works
-(6 s). Away from home, `vita put` it to `ux0:/vpk/` and install it in
-VitaShell. Reinstall after every rebuild: the system binds the service's
-SELF at install time. Then open the bubble; `vita launch TVIT00013` does
-that too, but only from the home screen (with a game in front the launch is
-ignored).
+`vita install tailnet/daemon/build/tailnet-daemon.vpk` works on the LAN (6 s)
+and over the tailnet (about 7 minutes at a hotspot's 5 KB/s). The Vita
+refuses to replace the package while its service runs, and over the tailnet
+that service is the link itself, so `vita` sends `quit TVIT00014; wait
+3000ms; promote <folder>` as one command: the Vita finishes it alone and the
+watchdog starts the new service. Reinstall after every rebuild; the system
+binds the service's SELF at install time.
+
+The SceShell module and the kernel helper are only replaced by a reboot
+followed by opening the bubble. `vita launch TVIT00013` opens it too, but
+only from the home screen (with a game in front the launch is ignored).
 
 Files that switch things off, in `ux0:data/tailnet-listener/`:
 `no-shell-module` (the launcher leaves SceShell alone), `no-capture` (the

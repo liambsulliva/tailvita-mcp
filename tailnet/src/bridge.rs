@@ -47,6 +47,12 @@ const LOCAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// How long a passive data port waits for the tailnet peer to connect.
 const DATA_ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
 const DATA_ACCEPT_SLICE: Duration = Duration::from_millis(250);
+/// How long a new passive data connection waits for a free slot. A finished
+/// transfer's slot is held until its bridge has seen both sides close, which
+/// on a slow link trails the client by a second or two; a client sending
+/// many small files asks for the next connection before that.
+const DATA_SLOT_WAIT: Duration = Duration::from_secs(8);
+const DATA_SLOT_POLL: Duration = Duration::from_millis(100);
 
 pub static ACTIVE_CONNS: AtomicUsize = AtomicUsize::new(0);
 pub static ACTIVE_DATA: AtomicUsize = AtomicUsize::new(0);
@@ -76,6 +82,27 @@ impl Slot {
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < max).then_some(n + 1))
             .ok()
             .map(|_| Slot(Arc::clone(counter)))
+    }
+
+    /// Like `try_acquire`, but keeps trying for up to `wait`, and gives up
+    /// early when `stop` is set.
+    pub fn acquire_within(
+        counter: &Arc<AtomicUsize>,
+        max: usize,
+        wait: Duration,
+        poll: Duration,
+        stop: &AtomicBool,
+    ) -> Option<Slot> {
+        let deadline = Instant::now() + wait;
+        loop {
+            if let Some(slot) = Slot::try_acquire(counter, max) {
+                return Some(slot);
+            }
+            if stop.load(Ordering::Acquire) || Instant::now() >= deadline {
+                return None;
+            }
+            thread::sleep(poll);
+        }
     }
 }
 
@@ -385,8 +412,14 @@ impl FtpSession {
         if let Some(old) = self.pending.take() {
             old.cancel();
         }
-        let slot = Slot::try_acquire(&self.sh.data_slots, self.sh.max_data)
-            .ok_or_else(|| "too many data connections".to_string())?;
+        let slot = Slot::acquire_within(
+            &self.sh.data_slots,
+            self.sh.max_data,
+            DATA_SLOT_WAIT,
+            DATA_SLOT_POLL,
+            &self.sh.stop,
+        )
+        .ok_or_else(|| "too many data connections".to_string())?;
         let listener = TcpListener::bind_handle(&self.sh.stack, port, 1).map_err(|e| e.to_string())?;
         let cancel = Arc::new(AtomicBool::new(false));
         let accepted = Arc::new(AtomicBool::new(false));
@@ -467,6 +500,38 @@ fn data_conn(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_slot_freed_while_waiting_is_taken() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let stop = AtomicBool::new(false);
+        let held = Slot::try_acquire(&count, 1).unwrap();
+        assert!(Slot::try_acquire(&count, 1).is_none(), "the only slot is held");
+        let releaser = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(60));
+            drop(held);
+        });
+        let got = Slot::acquire_within(&count, 1, Duration::from_secs(5), Duration::from_millis(5), &stop);
+        assert!(got.is_some(), "the waiter takes the slot once it is released");
+        releaser.join().unwrap();
+        assert_eq!(count.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn waiting_for_a_slot_gives_up_at_the_deadline_or_on_stop() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let _held = Slot::try_acquire(&count, 1).unwrap();
+        let stop = AtomicBool::new(false);
+        let started = Instant::now();
+        assert!(Slot::acquire_within(&count, 1, Duration::from_millis(40), Duration::from_millis(5), &stop).is_none());
+        assert!(started.elapsed() >= Duration::from_millis(40));
+
+        stop.store(true, Ordering::Release);
+        let started = Instant::now();
+        assert!(Slot::acquire_within(&count, 1, Duration::from_secs(5), Duration::from_millis(5), &stop).is_none());
+        assert!(started.elapsed() < Duration::from_secs(1), "stop ends the wait at once");
+        assert_eq!(count.load(Ordering::Acquire), 1, "a failed wait takes nothing");
+    }
 
     #[test]
     fn transfer_guard_counts_running_transfers() {
