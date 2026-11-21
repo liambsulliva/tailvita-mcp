@@ -168,17 +168,31 @@ do not open the bubble, or delete the bubble.
   start and 2.0 MiB once every thread was up; the heap peaked at 1.06 MiB
   used. Ghost Trick's own log showed 170 MB of its main memory free with the
   service running.
+- On a phone hotspot with Ghost Trick in front, the same checks pass at
+  about 5 KB/s: a screenshot takes 14 s (71 KB at quality 70) or 23 s
+  (103 KB at 85), and a 200 KB upload and download each take about 40 s and
+  come back identical.
+- A soak on the home network ran 15 minutes clean (a check every minute, two
+  identical screenshots); the heap stayed at 0.97 MiB used with a 1.16 MiB
+  peak. It was then cut short when the Vita changed networks, so the
+  one-hour soak is still to do.
 - One start took 110 s to come online instead of 20: Tailscale's control
   server answered the map request after 82 s. Not seen again.
 
 Open:
 
-- Once, starts by the watchdog reported success six times in a row and the
-  service never came up (no log line, no crash dump); opening the bubble
-  fixed it. Cause unknown. The watchdog now stops after 4 such starts
-  (that module is replaced at the next reboot).
+- Twice the service ended and then every start by the watchdog reported
+  success but the service never came up (no log line, no crash dump), 6
+  times the first time and 35 the second, until the bubble was opened
+  again. Both followed something being done on the Vita by hand (a crash
+  dialog the first time, a change of Wi-Fi network the second). The likely
+  cause is that the service only runs while the launcher's LiveArea card is
+  open: closing that card is the system's own way to end a background
+  service. Not confirmed. The watchdog now stops after 4 such starts (that
+  module is replaced at the next reboot).
+- Whether the service reconnects by itself after a change of network is
+  untested: it was not running during the one change so far.
 - The first time the bubble was opened after a game had ended the service,
   the Vita said its saved data was corrupt and offered to delete it.
   Answering yes let it start. Not seen since.
-- Not yet tested: sleep and wake, a Wi-Fi drop, a one-hour soak, and a
-  phone hotspot with this build.
+- Not yet tested: sleep and wake, and a full one-hour soak.
