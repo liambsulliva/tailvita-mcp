@@ -201,8 +201,9 @@ Open:
   dialog the first time, a change of Wi-Fi network the second). The likely
   cause is that the service only runs while the launcher's LiveArea card is
   open: closing that card is the system's own way to end a background
-  service. Not confirmed. The watchdog now stops after 4 such starts (that
-  module is replaced at the next reboot).
+  service. Not confirmed. The watchdog no longer gives up: the wait between
+  starts doubles from 15 s to 5 min (that module is replaced at the next
+  reboot).
 - Whether the service reconnects by itself after a change of network is
   untested: it was not running during the one change so far.
 - The first time the bubble was opened after a game had ended the service,

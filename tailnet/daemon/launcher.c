@@ -110,13 +110,18 @@ static SceUID find_shell(void)
 static int load_shell_module(SceUID shell)
 {
     SceIoStat st;
+    /* Without the shell module nothing clears a marker left by an earlier boot, and
+     * the service would call a helper that is not there. Dropping it only turns
+     * screenshots off. */
     if (sceIoGetstat(NO_HOOK, &st) >= 0) {
         say("launcher: %s exists; SceShell left alone", NO_HOOK);
+        sceIoRemove(CAP_READY);
         return 0;
     }
     int n = copy_file(MOD_SRC, MOD_DST);
     if (n <= 0) {
         say("launcher: copying the shell module failed (%08X)", (unsigned)n);
+        sceIoRemove(CAP_READY);
         return 0;
     }
     SceUID mod = taiLoadStartModuleForPid(shell, MOD_DST, 0, NULL, 0);
@@ -143,6 +148,15 @@ static void load_capture_module(SceUID shell, int first_open)
     if (!first_open) {
         say("launcher: not the first open of this boot; kernel helper left as it is (%s)",
             sceIoGetstat(CAP_READY, &st) >= 0 ? "loaded" : "not loaded");
+        return;
+    }
+    /* A second guard that does not rest on taiLoadStartModuleForPid's answer for a
+     * copy that returned NO_RESIDENT (never checked on the Vita). The shell module
+     * removes the marker on its first load of a boot, before this runs, so a marker
+     * still here means the helper was loaded earlier in this boot. */
+    if (sceIoGetstat(CAP_READY, &st) >= 0) {
+        say("launcher: %s exists, so the helper is already loaded this boot; not loading it again",
+            CAP_READY);
         return;
     }
     sceIoRemove(CAP_READY);
