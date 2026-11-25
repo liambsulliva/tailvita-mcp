@@ -1,5 +1,6 @@
 import base64
 import ftplib
+import importlib.util
 import io
 import json
 import os
@@ -8,12 +9,17 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 import zipfile
 
 SERVER_NAME = "vitacompanion"
 SERVER_VERSION = "0.1.0"
 PROTOCOL_VERSION = "2025-06-18"
-VITA_HOST = os.environ.get("VITA_HOST", "10.0.0.151")
+# VITA_HOST pins one address. Without it every call picks the route: the Vita on this
+# machine's local network first, the tailnet only when it isn't there.
+FORCED_HOST = os.environ.get("VITA_HOST", "")
+LAN_HOST = os.environ.get("VITA_LAN_HOST", "10.0.0.151")
+TAILNET_HOST = os.environ.get("VITA_TAILNET_HOST", "100.96.148.83")
 FTP_PORT = int(os.environ.get("VITA_FTP_PORT", "1337"))
 COMMAND_PORT = int(os.environ.get("VITA_COMMAND_PORT", "1338"))
 DEFAULT_SRC_VITA = os.environ.get("VITA_SRC_VITA", "")
@@ -26,10 +32,61 @@ LOOP_SECONDS = 1800
 BUILD_SECONDS = 900
 OUTPUT_TAIL = 12000
 LIST_LIMIT = 500
+ROUTE_SECONDS = 30
+SWEEP_AGAIN_SECONDS = 600
+
+
+def load_finder():
+    # python -I leaves this folder off the import path
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vita_find.py")
+    spec = importlib.util.spec_from_file_location("vita_find", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module.CMD_PORT = COMMAND_PORT
+    return module
+
+
+class Route:
+    """Where the Vita is: (name, host), kept for ROUTE_SECONDS. A network searched without
+    finding it is searched again after SWEEP_AGAIN_SECONDS, or by vita_status."""
+
+    def __init__(self):
+        self.finder = load_finder()
+        self.known = [LAN_HOST]
+        self.swept = {}
+        self.picked = None
+        self.until = 0.0
+
+    def pick(self, fresh=False):
+        if FORCED_HOST:
+            return "forced", FORCED_HOST
+        now = time.monotonic()
+        if self.picked and now < self.until and not fresh:
+            return self.picked
+        skip = [] if fresh else [net for net, at in self.swept.items() if now - at < SWEEP_AGAIN_SECONDS]
+        found = self.finder.find(self.known, skip)
+        for net in found["swept"]:
+            self.swept[net] = time.monotonic()
+        if found["host"]:
+            self.swept.pop(found["network"], None)
+            if found["host"] not in self.known:
+                self.known.insert(0, found["host"])
+            self.picked = "lan", found["host"]
+        else:
+            self.picked = "tailnet", TAILNET_HOST
+        self.until = time.monotonic() + ROUTE_SECONDS
+        return self.picked
+
+
+ROUTE = Route()
+
+
+def vita_host():
+    return ROUTE.pick()[1]
 
 
 def device_command(text, reply_seconds=REPLY_SECONDS):
-    with socket.create_connection((VITA_HOST, COMMAND_PORT), timeout=10) as connection:
+    with socket.create_connection((vita_host(), COMMAND_PORT), timeout=10) as connection:
         connection.sendall(text.strip().encode("ascii") + b"\n")
         connection.settimeout(reply_seconds)
         reply = b""
@@ -51,7 +108,7 @@ def remote(path):
 
 def open_ftp():
     connection = ftplib.FTP()
-    connection.connect(VITA_HOST, FTP_PORT, timeout=60)
+    connection.connect(vita_host(), FTP_PORT, timeout=60)
     connection.login("anonymous", "anonymous")
     connection.voidcmd("TYPE I")
     return connection
@@ -182,7 +239,7 @@ def src_vita_of(arguments):
 
 
 def run(command, folder, seconds, environment=None):
-    merged = dict(os.environ, VITA_HOST=VITA_HOST)
+    merged = dict(os.environ, VITA_HOST=vita_host())
     merged.update(environment or {})
     result = subprocess.run(command, cwd=folder, env=merged, capture_output=True, text=True, timeout=seconds)
     output = (result.stdout + result.stderr)[-OUTPUT_TAIL:]
@@ -203,7 +260,8 @@ def build(arguments):
 
 
 def status(_):
-    lines = ["host %s ftp %d command %d" % (VITA_HOST, FTP_PORT, COMMAND_PORT)]
+    name, host = ROUTE.pick(fresh=True)
+    lines = ["route %s host %s ftp %d command %d" % (name, host, FTP_PORT, COMMAND_PORT)]
     try:
         lines.append("companion: " + (device_command("version") or "no reply"))
     except OSError as error:
