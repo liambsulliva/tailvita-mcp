@@ -85,6 +85,16 @@ def vita_host():
     return ROUTE.pick()[1]
 
 
+def refuse_during_usb(name):
+    """The card is on the Mac in USB mode while the Vita still has it mounted."""
+    why = ROUTE.finder.usb() if name.startswith("vita_") and name not in NO_CARD else ""
+    if why:
+        raise RuntimeError(why + ". The network stays closed until `vita usb end` has run")
+
+
+NO_CARD = ("vita_status", "vita_build", "vita_show_image")
+
+
 def device_command(text, reply_seconds=REPLY_SECONDS):
     with socket.create_connection((vita_host(), COMMAND_PORT), timeout=10) as connection:
         connection.sendall(text.strip().encode("ascii") + b"\n")
@@ -272,6 +282,8 @@ def status(_):
         lines.append("ftp: answering")
     except (OSError, ftplib.Error) as error:
         lines.append("ftp unreachable: %s" % error)
+    if ROUTE.finder.usb():
+        lines.append("usb: " + ROUTE.finder.usb())
     return "\n".join(lines)
 
 
@@ -323,6 +335,7 @@ def call_tool(params):
     if name not in HANDLERS:
         return {"content": [{"type": "text", "text": "unknown tool: %s" % name}], "isError": True}
     try:
+        refuse_during_usb(name)
         outcome = HANDLERS[name](params.get("arguments") or {})
     except Exception as error:
         return {"content": [{"type": "text", "text": "%s: %s" % (type(error).__name__, error)}], "isError": True}

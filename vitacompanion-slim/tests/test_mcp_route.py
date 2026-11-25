@@ -55,6 +55,13 @@ class RouteTests(unittest.TestCase):
         self.server.ROUTE.pick()
         self.assertEqual(self.calls[1][0], ["192.168.4.30", "10.0.0.151"])
 
+    def test_usb_transfer_closes_the_network(self):
+        self.server.ROUTE.finder.usb = lambda: "a USB transfer is staged: copy game"
+        got = self.server.call_tool({"name": "vita_ftp_list", "arguments": {"path": "ux0:/"}})
+        self.assertTrue(got["isError"])
+        self.assertIn("copy game", got["content"][0]["text"])
+        self.assertEqual(self.calls, [])
+
     def test_vita_host_still_pins(self):
         self.assertEqual(load(VITA_HOST="192.0.2.7").ROUTE.pick(), ("forced", "192.0.2.7"))
 

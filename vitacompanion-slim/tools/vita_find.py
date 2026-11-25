@@ -26,12 +26,17 @@ import re
 import socket
 import subprocess
 import sys
+import time
 
 CMD_PORT = int(os.environ.get("VITA_CMD_PORT", "1338"))
 CONNECT_SECONDS = 1.5
 REPLY_SECONDS = 4.0
 WORKERS = 128  # macOS allows 256 open files per process over SSH
 MAX_ADDRESSES = 1024
+USB_VOLUMES = os.environ.get("VITA_USB_VOLUMES", "/Volumes")
+USB_SIGNS = ("app", "appmeta", "license", "user", "id.dat")
+USB_LEASE = os.path.expanduser(os.environ.get("VITA_USB_LEASE", "~/Developer/.nas-runs/.vita-usb/lease.json"))
+USB_LEASE_SECONDS = 7200
 PRIVATE = [ipaddress.ip_network(n) for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")]
 
 
@@ -70,9 +75,30 @@ def companion(host):
     return reply if reply.lower().startswith("vitacompanion") else None
 
 
+def usb():
+    """Why the card is off limits over the network, or "". bin/vita-usb has the rules: USB
+    mode gives the Mac the card while the Vita still has it mounted."""
+    try:
+        for name in os.listdir(USB_VOLUMES):
+            path = os.path.join(USB_VOLUMES, name)
+            if not os.path.islink(path) and all(os.path.exists(os.path.join(path, s)) for s in USB_SIGNS):
+                return f"the Vita's card is mounted on the Mac at {path}"
+    except OSError:
+        pass
+    try:
+        with open(USB_LEASE) as f:
+            held = json.load(f)
+        if time.time() - held["touched"] < USB_LEASE_SECONDS:
+            return f"a USB transfer is staged: {held['reason']}"
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return ""
+
+
 def find(candidates=(), skip_sweep=()):
     nets = networks()
-    result = {"host": None, "version": None, "network": None, "networks": [str(n) for n in nets], "swept": []}
+    result = {"host": None, "version": None, "network": None, "networks": [str(n) for n in nets], "swept": [],
+              "usb": usb()}
 
     def hit(host, net, version):
         result.update(host=host, network=str(net), version=version)
